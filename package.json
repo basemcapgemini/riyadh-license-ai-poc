@@ -1,0 +1,39 @@
+{
+  "name": "riyadh-license-ai-poc",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "build:knowledge": "node scripts/build-policy-knowledge.mjs",
+    "dev": "concurrently -k \"npm:dev:api\" \"npm:dev:web\"",
+    "dev:web": "vite",
+    "dev:api": "node server/review-server.mjs",
+    "build": "tsc -b && vite build",
+    "format:check": "prettier --check .",
+    "start": "node server/review-server.mjs",
+    "test": "NODE_OPTIONS=--experimental-vm-modules jest --runInBand",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@tanstack/react-query": "^5.76.2",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "mammoth": "^1.9.1",
+    "openai": "^4.104.0",
+    "pdfjs-dist": "^4.10.38",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "tesseract.js": "^6.0.1"
+  },
+  "devDependencies": {
+    "@types/jest": "^29.5.14",
+    "@types/react": "^18.3.3",
+    "@types/react-dom": "^18.3.0",
+    "concurrently": "^9.1.2",
+    "jest": "^29.7.0",
+    "prettier": "^3.8.3",
+    "supertest": "^7.1.1",
+    "typescript": "^5.6.3",
+    "vite": "^5.4.10"
+  }
+}
