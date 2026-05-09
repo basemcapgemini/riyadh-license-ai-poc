@@ -7,24 +7,33 @@ import {
   analyzeAttachments,
   collectDetectedDocuments,
 } from "./ai/attachmentAnalyzer";
+import { getSearchTerms, normalizeArabic } from "./ai/policySearch";
 import { reviewApplication } from "./ai/reviewEngine";
+import {
+  buildPolicyWithResolvedDocuments,
+  formatChecklistDocumentLabel,
+} from "./utils/policyRequiredDocuments";
 import type {
   ApplicationRecord,
+  AttachmentPreview,
   AttachmentAnalysisTraceEvent,
+  DocumentValidation,
   EvidenceCitation,
   LicensePolicy,
   LlmReview,
   SubmissionForm,
   SuggestedResponse,
   SuggestedResponseActionType,
+  UploadedAttachment,
 } from "./types";
 
 type ViewMode = "office" | "municipality";
 
-type SourcePreviewState = {
-  path: string;
+type PreviewState = {
   fileName: string;
-  kind: "pdf" | "html" | "unsupported";
+  kind: "pdf" | "html" | "image" | "unsupported";
+  path?: string;
+  sourceLabel?: string;
   url?: string;
   html?: string;
   message?: string;
@@ -38,14 +47,58 @@ type SourcePreviewResponse = {
   message?: string;
 };
 
-const APPLICATIONS_STORAGE_KEY = "riyadh-license-ai-poc.applications";
-const SELECTED_APPLICATION_STORAGE_KEY =
-  "riyadh-license-ai-poc.selectedApplicationId";
+type AttachmentReviewStatus = "passed" | "warning" | "missing";
+
+type AttachmentReviewDetails = {
+  attachmentId: string;
+  status: AttachmentReviewStatus;
+  summary: string;
+  alerts: string[];
+  strengths: string[];
+  matchedDocuments: string[];
+  validations: DocumentValidation[];
+};
+
+type DocumentUploadSlotStatus = "empty" | "passed" | "warning" | "missing";
+
+type DocumentUploadSlotAnalysis = {
+  status: DocumentUploadSlotStatus;
+  summary: string;
+  note?: string;
+  confidence?: number;
+};
+
+type BulkUploadMatchOption = {
+  documentName: string;
+  score: number;
+};
+
+type BulkUploadPreviewItem = {
+  id: string;
+  file: File;
+  selectedDocumentName: string;
+  suggestedDocumentName: string;
+  topCandidateDocumentName?: string;
+  suggestions: BulkUploadMatchOption[];
+};
+
+const LEGACY_STORAGE_KEYS = [
+  "riyadh-license-ai-poc.applications",
+  "riyadh-license-ai-poc.selectedApplicationId",
+];
+const LEGACY_ATTACHMENT_CACHE_PREFIX =
+  "riyadh-license-ai-poc.attachment-analysis.v4";
+const ENABLE_DRAFT_LLM_REVIEW =
+  String(
+    import.meta.env.VITE_ENABLE_DRAFT_LLM_REVIEW || "false",
+  ).toLowerCase() === "true";
+const AI_ANALYSIS_ICON_URL =
+  "https://static.thenounproject.com/png/6480915-200.png";
 
 const statusLabel = {
-  ready: "جاهز للاعتماد",
-  "needs-info": "بحاجة لاستكمال",
-  blocked: "متوقف",
+  ready: "قابل للاعتماد",
+  "needs-info": "بانتظار الاستكمال",
+  blocked: "يتطلب معالجة",
 };
 
 const llmDecisionLabel = {
@@ -68,7 +121,10 @@ const processSteps = {
   municipality: ["الاستلام", "التدقيق", "طلب استكمال أو اعتماد"],
 };
 
-function getSubmissionValidationErrors(form: SubmissionForm) {
+function getSubmissionValidationErrors(
+  form: SubmissionForm,
+  policy: LicensePolicy,
+) {
   const errors: string[] = [];
 
   if (!form.applicantName.trim()) errors.push("اسم المستفيد مطلوب.");
@@ -78,12 +134,323 @@ function getSubmissionValidationErrors(form: SubmissionForm) {
   if (!form.mobile.trim()) errors.push("رقم الجوال مطلوب.");
   if (!form.district.trim()) errors.push("بيانات الحي مطلوبة.");
   if (!form.plotNumber.trim()) errors.push("رقم القطعة أو المخطط مطلوب.");
+  if ((policy.projectTypes?.length ?? 0) > 0 && !form.projectTypeGroupId) {
+    errors.push("نوع المشروع مطلوب.");
+  }
+  if ((policy.projectTypes?.length ?? 0) > 0 && !form.projectSubtypeId) {
+    errors.push("التصنيف التفصيلي للمشروع مطلوب.");
+  }
   if (form.projectDescription.trim().length < 20)
     errors.push("وصف المشروع يجب أن يكون أوضح وأطول من 20 حرفاً.");
   if (form.uploadedAttachments.length === 0)
     errors.push("يجب رفع ملف فعلي واحد على الأقل قبل الإرسال.");
 
   return errors;
+}
+
+function getProjectTypeGroups(policy: LicensePolicy) {
+  return policy.projectTypes ?? [];
+}
+
+function getSelectedProjectTypeGroup(
+  policy: LicensePolicy,
+  projectTypeGroupId: string,
+) {
+  return getProjectTypeGroups(policy).find(
+    (group) => group.id === projectTypeGroupId,
+  );
+}
+
+function getSelectedProjectSubtype(
+  policy: LicensePolicy,
+  projectTypeGroupId: string,
+  projectSubtypeId: string,
+) {
+  return getSelectedProjectTypeGroup(policy, projectTypeGroupId)?.subtypes.find(
+    (subtype) => subtype.id === projectSubtypeId,
+  );
+}
+
+function buildProjectTypeSummary(
+  policy: LicensePolicy,
+  projectTypeGroupId: string,
+  projectSubtypeId: string,
+) {
+  const group = getSelectedProjectTypeGroup(policy, projectTypeGroupId);
+  const subtype = getSelectedProjectSubtype(
+    policy,
+    projectTypeGroupId,
+    projectSubtypeId,
+  );
+
+  if (!group) {
+    return "غير محدد";
+  }
+
+  if (!subtype) {
+    return group.title;
+  }
+
+  return `${group.title} / ${subtype.title}`;
+}
+
+function stripFileExtension(fileName: string) {
+  return fileName.replace(/\.[^.]+$/u, "");
+}
+
+function buildFilenameMatchTerms(documentName: string) {
+  return uniqueStrings([
+    documentName,
+    formatChecklistDocumentLabel(documentName),
+    ...getSearchTerms(documentName),
+  ])
+    .map((term) => normalizeArabic(term))
+    .filter(Boolean);
+}
+
+function scoreFilenameAgainstDocument(fileName: string, documentName: string) {
+  const normalizedFileName = normalizeArabic(
+    stripFileExtension(fileName).replace(/[_\-.]+/gu, " "),
+  );
+  if (!normalizedFileName) {
+    return 0;
+  }
+
+  const normalizedDocumentName = normalizeArabic(documentName);
+  const terms = buildFilenameMatchTerms(documentName);
+  let score = 0;
+
+  terms.forEach((term) => {
+    if (!term || !normalizedFileName.includes(term)) {
+      return;
+    }
+
+    score += Math.max(6, term.length * 3);
+    if (term === normalizedDocumentName) {
+      score += 20;
+    }
+  });
+
+  return score;
+}
+
+function findBestFilenameDocumentMatch(
+  fileName: string,
+  requiredDocuments: string[],
+) {
+  const scoredDocuments = requiredDocuments
+    .map((documentName) => ({
+      documentName,
+      score: scoreFilenameAgainstDocument(fileName, documentName),
+    }))
+    .filter((item) => item.score > 0)
+    .sort((left, right) => right.score - left.score);
+
+  return scoredDocuments[0] ?? null;
+}
+
+function buildFilenameMatchOptions(
+  fileName: string,
+  requiredDocuments: string[],
+) {
+  return requiredDocuments
+    .map((documentName) => ({
+      documentName,
+      score: scoreFilenameAgainstDocument(fileName, documentName),
+    }))
+    .filter((item) => item.score > 0)
+    .sort((left, right) => right.score - left.score);
+}
+
+function buildBulkUploadPreviewItems(
+  files: File[],
+  requiredDocuments: string[],
+) {
+  const items: BulkUploadPreviewItem[] = files.map((file, index) => {
+    const suggestions = buildFilenameMatchOptions(file.name, requiredDocuments);
+    return {
+      id: `${file.name}-${file.size}-${file.lastModified}-${index}`,
+      file,
+      selectedDocumentName: "",
+      suggestedDocumentName: "",
+      topCandidateDocumentName: suggestions[0]?.documentName,
+      suggestions,
+    };
+  });
+
+  const reservedDocuments = new Set<string>();
+  const rankedItems = [...items].sort((left, right) => {
+    const leftScore = left.suggestions[0]?.score ?? 0;
+    const rightScore = right.suggestions[0]?.score ?? 0;
+    return rightScore - leftScore;
+  });
+
+  rankedItems.forEach((item) => {
+    const selectedMatch = item.suggestions.find(
+      (suggestion) => !reservedDocuments.has(suggestion.documentName),
+    );
+
+    if (!selectedMatch) {
+      return;
+    }
+
+    item.selectedDocumentName = selectedMatch.documentName;
+    item.suggestedDocumentName = selectedMatch.documentName;
+    reservedDocuments.add(selectedMatch.documentName);
+  });
+
+  return items;
+}
+
+function uniqueStrings(values: string[]) {
+  return Array.from(new Set(values.filter(Boolean)));
+}
+
+function getValidatedDocumentNames(validations: DocumentValidation[]) {
+  return uniqueStrings(
+    validations
+      .filter((validation) => validation.status === "passed")
+      .map((validation) => validation.documentName),
+  );
+}
+
+function getWarningDocumentNames(validations: DocumentValidation[]) {
+  return uniqueStrings(
+    validations
+      .filter((validation) => validation.status === "warning")
+      .map((validation) => validation.documentName),
+  );
+}
+
+function buildAttachmentReviewDetails(
+  attachment: UploadedAttachment,
+  validations: DocumentValidation[],
+): AttachmentReviewDetails {
+  const relatedValidations = validations.filter((validation) =>
+    attachment.detectedDocuments.includes(validation.documentName),
+  );
+  const warningValidations = relatedValidations.filter(
+    (validation) => validation.status === "warning",
+  );
+  const passedValidations = relatedValidations.filter(
+    (validation) => validation.status === "passed",
+  );
+
+  const alerts = uniqueStrings([
+    ...(attachment.aiValidation?.status === "missing"
+      ? [attachment.aiValidation.summary]
+      : []),
+    ...(attachment.aiValidation?.status === "warning"
+      ? [attachment.aiValidation.summary]
+      : []),
+    ...(attachment.aiValidation?.feedback ?? []),
+    ...(!attachment.aiValidation && attachment.detectedDocuments.length === 0
+      ? ["لم يتم ربط هذا الملف بأي مستند مطلوب من القائمة الحالية."]
+      : []),
+    ...(!attachment.aiValidation && attachment.extractedText.trim().length < 80
+      ? ["النص المستخرج من هذا الملف محدود، وقد تحتاج القراءة إلى ملف أوضح."]
+      : []),
+    ...warningValidations.map(
+      (validation) =>
+        `${formatChecklistDocumentLabel(validation.documentName)} موجود في هذا الملف لكنه ما زال يحتاج تدقيقاً بشرياً.`,
+    ),
+  ]);
+
+  const strengths = uniqueStrings([
+    ...(attachment.aiValidation?.status === "passed"
+      ? [attachment.aiValidation.summary]
+      : []),
+    ...attachment.detectedDocuments.map(
+      (documentName) =>
+        `تم ربط الملف مع ${formatChecklistDocumentLabel(documentName)}.`,
+    ),
+    ...passedValidations.map(
+      (validation) =>
+        `${formatChecklistDocumentLabel(validation.documentName)} يحمل مؤشرات كافية داخل هذا الملف.`,
+    ),
+  ]);
+
+  const status: AttachmentReviewStatus =
+    attachment.aiValidation?.status === "passed"
+      ? "passed"
+      : attachment.aiValidation?.status === "warning"
+        ? "warning"
+        : attachment.aiValidation?.status === "missing"
+          ? "missing"
+          : attachment.detectedDocuments.length === 0
+            ? "missing"
+            : alerts.length > 0
+              ? "warning"
+              : "passed";
+
+  const summary =
+    attachment.aiValidation?.summary ||
+    "تعذر استكمال قراءة هذا الملف آلياً في الوقت الحالي.";
+
+  return {
+    attachmentId: attachment.id,
+    status,
+    summary,
+    alerts,
+    strengths,
+    matchedDocuments: attachment.detectedDocuments,
+    validations: relatedValidations,
+  };
+}
+
+function buildAttachmentReviewCollection(
+  attachments: UploadedAttachment[],
+  validations: DocumentValidation[],
+) {
+  return attachments.map((attachment) =>
+    buildAttachmentReviewDetails(attachment, validations),
+  );
+}
+
+function getAttachmentForRequiredDocument(
+  attachments: UploadedAttachment[],
+  documentName: string,
+) {
+  return attachments.find(
+    (attachment) => attachment.requiredDocument === documentName,
+  );
+}
+
+function buildDocumentUploadSlotAnalysis(
+  documentName: string,
+  attachment: UploadedAttachment | undefined,
+  validations: DocumentValidation[],
+): DocumentUploadSlotAnalysis {
+  if (!attachment) {
+    return {
+      status: "empty",
+      summary: "",
+    };
+  }
+
+  const validation = validations.find(
+    (item) => item.documentName === documentName,
+  );
+  const matchesTarget = attachment.detectedDocuments.includes(documentName);
+
+  if (attachment.aiValidation) {
+    return {
+      status: attachment.aiValidation.status,
+      summary: attachment.aiValidation.summary,
+      note: attachment.aiValidation.feedback[0] || undefined,
+      confidence:
+        Number.isFinite(attachment.aiValidation.confidence) &&
+        attachment.aiValidation.confidence > 0
+          ? attachment.aiValidation.confidence
+          : undefined,
+    };
+  }
+
+  return {
+    status: "warning",
+    summary: "تعذر استكمال قراءة هذا الملف آلياً في الوقت الحالي.",
+    note: undefined,
+  };
 }
 
 function buildOfficeReply(
@@ -169,34 +536,6 @@ function normalizeSuggestedResponsesForDisplay(
   return normalized;
 }
 
-function loadStoredApplications() {
-  if (typeof window === "undefined") {
-    return [] as ApplicationRecord[];
-  }
-
-  try {
-    const rawValue = window.localStorage.getItem(APPLICATIONS_STORAGE_KEY);
-    if (!rawValue) {
-      return [] as ApplicationRecord[];
-    }
-
-    const parsedValue = JSON.parse(rawValue);
-    return Array.isArray(parsedValue)
-      ? (parsedValue as ApplicationRecord[])
-      : [];
-  } catch {
-    return [] as ApplicationRecord[];
-  }
-}
-
-function loadStoredSelectedApplicationId() {
-  if (typeof window === "undefined") {
-    return "";
-  }
-
-  return window.localStorage.getItem(SELECTED_APPLICATION_STORAGE_KEY) ?? "";
-}
-
 function buildSubmissionFromApplication(
   application: ApplicationRecord,
 ): SubmissionForm {
@@ -208,10 +547,18 @@ function buildSubmissionFromApplication(
     mobile: "",
     district: application.district,
     plotNumber: application.plotNumber,
+    projectTypeGroupId: application.projectTypeGroupId ?? "",
+    projectSubtypeId: application.projectSubtypeId ?? "",
     projectDescription: application.projectDescription,
     selectedDocuments: application.selectedDocuments,
     comments: application.comments,
-    uploadedAttachments: application.uploadedAttachments,
+    uploadedAttachments: application.uploadedAttachments.map((attachment) => ({
+      ...attachment,
+      requiredDocument:
+        attachment.requiredDocument ||
+        attachment.detectedDocuments[0] ||
+        undefined,
+    })),
   };
 }
 
@@ -257,6 +604,28 @@ function FileReferenceAction({
   );
 }
 
+function AttachmentPreviewAction({
+  attachment,
+  onPreview,
+}: {
+  attachment: UploadedAttachment;
+  onPreview: (attachment: UploadedAttachment) => void;
+}) {
+  if (!attachment.preview || attachment.preview.kind === "unsupported") {
+    return null;
+  }
+
+  return (
+    <button
+      type="button"
+      className="ghost-button file-preview-button"
+      onClick={() => onPreview(attachment)}
+    >
+      معاينة الملف
+    </button>
+  );
+}
+
 function HelpHint({ text }: { text: string }) {
   return (
     <span className="help-hint" title={text} aria-label={text}>
@@ -294,18 +663,32 @@ function SmartDisclosure({
   defaultOpen = false,
 }: {
   title: string;
-  count?: number;
+  count?: ReactNode;
   children: ReactNode;
   defaultOpen?: boolean;
 }) {
+  const [isOpen, setIsOpen] = useState(defaultOpen);
+
   return (
-    <details className="smart-disclosure" open={defaultOpen}>
-      <summary>
+    <div className="smart-disclosure">
+      <button
+        type="button"
+        className="smart-disclosure-trigger"
+        aria-expanded={isOpen}
+        onClick={() => setIsOpen((current) => !current)}
+      >
         <span>{title}</span>
-        {typeof count === "number" ? <strong>{count}</strong> : null}
-      </summary>
-      <div className="smart-disclosure-body">{children}</div>
-    </details>
+        <span className="smart-disclosure-summary-meta">
+          {count !== undefined && count !== null ? (
+            <strong>{count}</strong>
+          ) : null}
+          <span className="smart-disclosure-toggle" aria-hidden="true">
+            {isOpen ? "▾" : "▸"}
+          </span>
+        </span>
+      </button>
+      {isOpen ? <div className="smart-disclosure-body">{children}</div> : null}
+    </div>
   );
 }
 
@@ -329,42 +712,6 @@ function ReviewGlance({
           <strong>{item.value}</strong>
         </div>
       ))}
-    </div>
-  );
-}
-
-function EvidenceList({
-  title,
-  citations,
-  onPreviewSource,
-}: {
-  title: string;
-  citations: EvidenceCitation[];
-  onPreviewSource: (path: string) => void;
-}) {
-  return (
-    <div className="review-card source-card compact-card">
-      <SmartDisclosure title={title} count={citations.length}>
-        <div className="citation-stack">
-          {citations.map((citation) => (
-            <article key={citation.id} className="citation-item">
-              <strong>{citation.label}</strong>
-              <span>{citation.sourceFileName}</span>
-              <p>{citation.excerpt}</p>
-              <em>مطابقة على: {citation.matchedText}</em>
-              <FileReferenceAction
-                path={citation.sourcePath}
-                onPreview={onPreviewSource}
-              />
-            </article>
-          ))}
-          {citations.length === 0 ? (
-            <div className="empty-attachments">
-              لا توجد شواهد مطابقة من ملف السياسة المصدر.
-            </div>
-          ) : null}
-        </div>
-      </SmartDisclosure>
     </div>
   );
 }
@@ -407,8 +754,7 @@ function selectSuggestedResponses(
 }
 
 function ValidationSourceLabel({ source }: { source?: "rule" | "ai" }) {
-  const label =
-    source === "ai" ? "من تحليل الذكاء الاصطناعي" : "من التحقق القاعدي";
+  const label = source === "ai" ? "من المراجعة الآلية" : "من التحقق النظامي";
   return (
     <span
       className={`status-pill validation-source ${source === "ai" ? "ai" : "rule"}`}
@@ -450,26 +796,216 @@ function ValidationCards({
             </div>
           </div>
           <p>{validation.summary}</p>
-          <ul>
-            {validation.details.map((detail) => (
-              <li key={detail}>{detail}</li>
-            ))}
-          </ul>
-          {validation.evidenceSnippets &&
-          validation.evidenceSnippets.length > 0 ? (
-            <div className="validation-evidence-block">
-              <strong>شواهد من الورقة</strong>
-              <div className="validation-evidence-list">
-                {validation.evidenceSnippets.map((snippet) => (
-                  <p key={snippet} className="validation-evidence-snippet">
-                    {snippet}
-                  </p>
-                ))}
-              </div>
-            </div>
+          {validation.details.length > 0 ||
+          (validation.evidenceSnippets?.length ?? 0) > 0 ? (
+            <details className="compact-inline-disclosure">
+              <summary>عرض التفاصيل</summary>
+              {validation.details.length > 0 ? (
+                <ul>
+                  {validation.details.map((detail) => (
+                    <li key={detail}>{detail}</li>
+                  ))}
+                </ul>
+              ) : null}
+              {validation.evidenceSnippets &&
+              validation.evidenceSnippets.length > 0 ? (
+                <div className="validation-evidence-block">
+                  <strong>شواهد من الورقة</strong>
+                  <div className="validation-evidence-list">
+                    {validation.evidenceSnippets.map((snippet) => (
+                      <p key={snippet} className="validation-evidence-snippet">
+                        {snippet}
+                      </p>
+                    ))}
+                  </div>
+                </div>
+              ) : null}
+            </details>
           ) : null}
         </article>
       ))}
+    </div>
+  );
+}
+
+function AttachmentReviewCards({
+  attachments,
+  validations,
+  onPreviewAttachment,
+}: {
+  attachments: UploadedAttachment[];
+  validations: DocumentValidation[];
+  onPreviewAttachment: (attachment: UploadedAttachment) => void;
+}) {
+  const reviewItems = buildAttachmentReviewCollection(attachments, validations);
+
+  return (
+    <div className="attachment-stack compact">
+      {attachments.map((attachment) => {
+        const review =
+          reviewItems.find((item) => item.attachmentId === attachment.id) ??
+          buildAttachmentReviewDetails(attachment, validations);
+        const checklistResults =
+          attachment.aiValidation?.checklistResults ?? [];
+        const validatedDocuments = getValidatedDocumentNames(
+          review.validations,
+        );
+        const warningDocuments = getWarningDocumentNames(review.validations);
+
+        return (
+          <article
+            key={attachment.id}
+            className={`attachment-card compact ${review.status}`}
+          >
+            <div className="attachment-header">
+              <div>
+                <strong>{attachment.name}</strong>
+                <span>
+                  {attachment.sourceType} -{" "}
+                  {Math.max(1, Math.round(attachment.size / 1024))} KB
+                </span>
+              </div>
+              <div className="attachment-card-actions">
+                <AttachmentPreviewAction
+                  attachment={attachment}
+                  onPreview={onPreviewAttachment}
+                />
+                <span className={`status-pill validation-${review.status}`}>
+                  {review.status === "passed"
+                    ? "واضح"
+                    : review.status === "warning"
+                      ? "يحتاج انتباهاً"
+                      : "غير مرتبط"}
+                </span>
+              </div>
+            </div>
+
+            <p>{review.summary}</p>
+
+            <div className="attachment-simple-grid">
+              <div className="attachment-simple-section">
+                <small>تم العثور عليه</small>
+                {review.matchedDocuments.length > 0 ? (
+                  <div className="attachment-tags">
+                    {review.matchedDocuments.map((documentName) => (
+                      <span key={documentName} className="tag success-tag">
+                        {formatChecklistDocumentLabel(documentName)}
+                      </span>
+                    ))}
+                  </div>
+                ) : (
+                  <p className="attachment-empty-note">
+                    لم يتم العثور على مستند مطلوب داخل هذا الملف.
+                  </p>
+                )}
+              </div>
+
+              <div className="attachment-simple-section">
+                <small>تم التحقق منه</small>
+                {validatedDocuments.length > 0 ? (
+                  <div className="attachment-tags">
+                    {validatedDocuments.map((documentName) => (
+                      <span key={documentName} className="tag success-tag">
+                        {formatChecklistDocumentLabel(documentName)}
+                      </span>
+                    ))}
+                  </div>
+                ) : (
+                  <p className="attachment-empty-note">
+                    لا يوجد تحقق مكتمل بعد لهذا الملف.
+                  </p>
+                )}
+              </div>
+
+              <div className="attachment-simple-section">
+                <small>يحتاج تدقيق</small>
+                {warningDocuments.length > 0 ? (
+                  <div className="attachment-tags">
+                    {warningDocuments.map((documentName) => (
+                      <span key={documentName} className="tag warning-tag">
+                        {formatChecklistDocumentLabel(documentName)}
+                      </span>
+                    ))}
+                  </div>
+                ) : (
+                  <p className="attachment-empty-note">
+                    لا توجد عناصر مفتوحة لهذا الملف.
+                  </p>
+                )}
+              </div>
+            </div>
+
+            {review.alerts.length > 0 ||
+            review.strengths.length > 0 ||
+            review.validations.length > 0 ||
+            checklistResults.length > 0 ? (
+              <details className="compact-inline-disclosure attachment-extra-details">
+                <summary>تفاصيل إضافية</summary>
+                {review.alerts.length > 0 ? (
+                  <div className="validation-evidence-block">
+                    <strong>ملاحظات</strong>
+                    <ul>
+                      {review.alerts.map((alert) => (
+                        <li key={alert}>{alert}</li>
+                      ))}
+                    </ul>
+                  </div>
+                ) : null}
+
+                {review.validations.length > 0 ? (
+                  <div className="validation-evidence-block">
+                    <strong>نتائج التحقق</strong>
+                    <ul>
+                      {review.validations.map((validation) => (
+                        <li key={validation.documentName}>
+                          {formatChecklistDocumentLabel(
+                            validation.documentName,
+                          )}
+                          : {validation.summary}
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                ) : null}
+
+                {checklistResults.length > 0 ? (
+                  <div className="validation-evidence-block attachment-checklist-block">
+                    <strong>نتائج فحص عناصر المخطط المعماري</strong>
+                    <ul>
+                      {checklistResults.map((result) => (
+                        <li key={`${attachment.id}-${result.item}`}>
+                          <strong>{result.item}</strong>
+                          {`: ${
+                            result.status === "Compliant"
+                              ? "متوافق"
+                              : result.status === "Non-Compliant"
+                                ? "غير متوافق"
+                                : "غير موجود"
+                          } - ${result.comment}`}
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                ) : null}
+
+                {review.strengths.length > 0 ? (
+                  <div className="validation-evidence-block">
+                    <strong>ما يدعمه الملف</strong>
+                    <ul>
+                      {review.strengths.slice(0, 4).map((strength) => (
+                        <li key={strength}>{strength}</li>
+                      ))}
+                    </ul>
+                  </div>
+                ) : null}
+              </details>
+            ) : null}
+          </article>
+        );
+      })}
+      {attachments.length === 0 ? (
+        <div className="empty-attachments">لم يتم رفع ملفات بعد.</div>
+      ) : null}
     </div>
   );
 }
@@ -519,8 +1055,8 @@ function SuggestedResponsesSection({
                     className={`status-pill validation-source ${response.source === "ai" ? "ai" : "rule"}`}
                   >
                     {response.source === "ai"
-                      ? "من تحليل الذكاء الاصطناعي"
-                      : "من التحقق القاعدي"}
+                      ? "من المراجعة الآلية"
+                      : "من التحقق النظامي"}
                   </span>
                 </div>
                 <p>{response.text}</p>
@@ -542,14 +1078,35 @@ function SuggestedResponsesSection({
   );
 }
 
-function LoadingBanner({ message }: { message: string }) {
+function AiAnalysisIcon({ className = "" }: { className?: string }) {
+  return (
+    <img
+      className={["ai-analysis-icon", className].filter(Boolean).join(" ")}
+      src={AI_ANALYSIS_ICON_URL}
+      alt=""
+      aria-hidden="true"
+    />
+  );
+}
+
+function LoadingBanner({
+  message,
+  icon = "spinner",
+}: {
+  message: string;
+  icon?: "spinner" | "ai";
+}) {
   return (
     <div
       className="upload-status loading-banner"
       role="status"
       aria-live="polite"
     >
-      <span className="spinner" aria-hidden="true" />
+      {icon === "ai" ? (
+        <AiAnalysisIcon className="ai-analysis-icon-md ai-analysis-icon-pulse" />
+      ) : (
+        <span className="spinner" aria-hidden="true" />
+      )}
       <span>{message}</span>
     </div>
   );
@@ -573,18 +1130,17 @@ function AnalysisTracePanel({
 
   return (
     <div className="analysis-trace-wrapper">
-      <LoadingBanner message={message} />
+      <LoadingBanner message={message} icon="ai" />
       <details className="analysis-trace-panel" open={active}>
         <summary>
-          <span>عرض مسار التحليل</span>
+          <span>سجل المعالجة</span>
           <strong>{events.length}</strong>
         </summary>
         <div className="analysis-trace-meta">
           <span>خطوات مكتملة: {successfulEvents}</span>
-          <span>خطوات جارية: {runningEvents}</span>
+          <span>خطوات قيد التنفيذ: {runningEvents}</span>
           <span>
-            يعرض هذا القسم المسار التشغيلي وملخصات الاستجابة، وليس التفكير
-            الداخلي للنموذج.
+            يعرض هذا القسم ما تم تنفيذه على الملفات وملخص المخرجات التشغيلية.
           </span>
         </div>
         <div className="analysis-trace-list">
@@ -626,6 +1182,246 @@ function AnalysisTracePanel({
   );
 }
 
+function ComplianceReportSection({ review }: { review: LlmReview }) {
+  const report = review.complianceReport;
+  if (!report) {
+    return null;
+  }
+
+  const missingAttachmentRows = report.attachmentsStatus.rows.filter(
+    (row) => row.status === "Missing",
+  );
+
+  const formatConfidenceLevel = (value: string) => {
+    if (value === "High") return "عالٍ";
+    if (value === "Medium") return "متوسط";
+    if (value === "Low") return "منخفض";
+    return value;
+  };
+
+  const formatAttachmentStatus = (value: string) => {
+    if (value === "Present") return "موجود";
+    if (value === "Missing") return "مفقود";
+    if (value === "Invalid / Unclear") return "غير واضح / غير صالح";
+    return value;
+  };
+
+  const formatDataConsistencyStatus = (value: string) => {
+    if (value === "Match") return "متطابق";
+    if (value === "Mismatch") return "غير متطابق";
+    if (value === "Missing") return "مفقود";
+    return value;
+  };
+
+  const formatAttachmentAccuracyStatus = (value: string) => {
+    if (value === "Valid") return "سليم";
+    if (value === "Invalid") return "غير صالح";
+    if (value === "Partially Valid") return "صالح جزئياً";
+    return value;
+  };
+
+  const formatRequirementsStatus = (value: string) => {
+    if (value === "Compliant") return "متوافق";
+    if (value === "Not Compliant") return "غير متوافق";
+    return value;
+  };
+
+  const formatChecklistStatus = (value: string) => {
+    if (value === "Compliant") return "متوافق";
+    if (value === "Non-Compliant") return "غير متوافق";
+    if (value === "Not Found") return "غير موجود";
+    return value;
+  };
+
+  const formatOverallStatus = (value: string) => {
+    if (value === "Complete") return "مكتمل";
+    if (value === "Incomplete") return "غير مكتمل";
+    return value;
+  };
+
+  const formatFieldLabel = (value: string) => {
+    if (value === "Plot Number") return "رقم القطعة";
+    if (value === "Beneficiary Name") return "اسم المستفيد";
+    if (value === "Engineering Office") return "المكتب الهندسي";
+    if (value === "Plan Number") return "رقم المخطط";
+    if (value === "Deed Number") return "رقم الصك";
+    return value;
+  };
+
+  return (
+    <SmartDisclosure title="تقرير الامتثال المنظم" defaultOpen>
+      <div className="compliance-report-stack">
+        <div className="review-card compact-card tone-neutral">
+          <h4>1. معلومات المشروع</h4>
+          <ul>
+            <li>نوع المشروع: {report.projectInformation.projectType}</li>
+            <li>
+              مستوى الثقة:{" "}
+              {formatConfidenceLevel(report.projectInformation.confidenceLevel)}
+            </li>
+          </ul>
+        </div>
+
+        <SmartDisclosure
+          title="2. حالة المرفقات"
+          count={report.attachmentsStatus.rows.length}
+        >
+          <div className="review-card compact-card tone-neutral">
+            <p>
+              الحالة العامة:{" "}
+              {formatOverallStatus(report.attachmentsStatus.overallStatus)}
+            </p>
+            {missingAttachmentRows.length > 0 ? (
+              <ul>
+                {missingAttachmentRows.map((row) => (
+                  <li key={row.attachment}>
+                    {row.attachment}: هذا المرفق مفقود ويجب استكماله.
+                  </li>
+                ))}
+              </ul>
+            ) : null}
+          </div>
+          <div className="table-scroll">
+            <table className="compliance-table">
+              <thead>
+                <tr>
+                  <th>المرفق</th>
+                  <th>الحالة</th>
+                  <th>الملاحظات</th>
+                </tr>
+              </thead>
+              <tbody>
+                {report.attachmentsStatus.rows.map((row) => (
+                  <tr key={row.attachment}>
+                    <td>{row.attachment}</td>
+                    <td>{formatAttachmentStatus(row.status)}</td>
+                    <td>{row.notes}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </SmartDisclosure>
+
+        <SmartDisclosure
+          title="3. التحقق من اتساق البيانات"
+          count={report.dataConsistencyCheck.length}
+        >
+          <div className="table-scroll">
+            <table className="compliance-table">
+              <thead>
+                <tr>
+                  <th>الحقل</th>
+                  <th>الصك</th>
+                  <th>المستندات الأخرى</th>
+                  <th>الحالة</th>
+                </tr>
+              </thead>
+              <tbody>
+                {report.dataConsistencyCheck.map((row) => (
+                  <tr key={row.field}>
+                    <td>{formatFieldLabel(row.field)}</td>
+                    <td>{row.sak}</td>
+                    <td>{row.otherDocs}</td>
+                    <td>{formatDataConsistencyStatus(row.status)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </SmartDisclosure>
+
+        <SmartDisclosure title="4. دقة المرفقات">
+          <div className="review-card compact-card tone-neutral">
+            <p>
+              {formatAttachmentAccuracyStatus(report.attachmentAccuracy.status)}
+            </p>
+            <h5>ملاحظات:</h5>
+            {report.attachmentAccuracy.notes.length > 0 ? (
+              <ul>
+                {report.attachmentAccuracy.notes.map((note) => (
+                  <li key={note}>{note}</li>
+                ))}
+              </ul>
+            ) : null}
+          </div>
+        </SmartDisclosure>
+
+        <SmartDisclosure
+          title="5. الامتثال المعماري"
+          count={report.architecturalCompliance.notesForCheck.length}
+          defaultOpen
+        >
+          <div className="review-card compact-card tone-neutral">
+            <h5>5.1 الامتثال للاشتراطات:</h5>
+            <p>
+              {formatRequirementsStatus(
+                report.architecturalCompliance.requirementsCompliance,
+              )}
+            </p>
+          </div>
+
+          <div className="review-card compact-card tone-neutral">
+            <h5>5.2 عناصر التدقيق:</h5>
+          </div>
+          <div className="table-scroll">
+            <table className="compliance-table">
+              <thead>
+                <tr>
+                  <th>العنصر</th>
+                  <th>الحالة</th>
+                  <th>التعليق</th>
+                </tr>
+              </thead>
+              <tbody>
+                {report.architecturalCompliance.notesForCheck.map((row) => (
+                  <tr key={`${row.item}-${row.comment}`}>
+                    <td>{row.item}</td>
+                    <td>{formatChecklistStatus(row.status)}</td>
+                    <td>{row.comment}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+
+          <div className="review-card compact-card tone-warning">
+            <h5>5.3 المخالفات:</h5>
+            <ul>
+              {report.architecturalCompliance.violations.map((item) => (
+                <li key={item}>{item}</li>
+              ))}
+              {report.architecturalCompliance.violations.length === 0 ? (
+                <li>لم يتم العثور على مخالفات مؤكدة ضمن الأدلة الحالية.</li>
+              ) : null}
+            </ul>
+          </div>
+        </SmartDisclosure>
+
+        <div className="review-card compact-card tone-neutral">
+          <h4>6. الملخص النهائي</h4>
+          <ul>
+            <li>المرفقات: {report.finalSummary.attachments}</li>
+            <li>اتساق البيانات: {report.finalSummary.dataConsistency}</li>
+            <li>
+              الامتثال المعماري: {report.finalSummary.architecturalCompliance}
+            </li>
+          </ul>
+          <h5>القضايا الرئيسية:</h5>
+          <ul>
+            {report.finalSummary.keyIssues.map((issue) => (
+              <li key={issue}>{issue}</li>
+            ))}
+            {report.finalSummary.keyIssues.length === 0 ? (
+              <li>لا توجد قضايا حرجة مسجلة.</li>
+            ) : null}
+          </ul>
+        </div>
+      </div>
+    </SmartDisclosure>
+  );
+}
+
 function LlmSupportContent({
   review,
   loading,
@@ -641,14 +1437,17 @@ function LlmSupportContent({
     <>
       {error ? <div className="upload-status error">{error}</div> : null}
       {loading ? (
-        <LoadingBanner message="يتم الآن تعزيز النتيجة تلقائياً عبر تحليل نصوص الملفات والسياسة." />
+        <LoadingBanner
+          message="جاري استكمال المراجعة المساندة وربط نتائج الملفات بالمرجع التنظيمي."
+          icon="ai"
+        />
       ) : null}
 
       {review ? (
         <>
           <div className="section-title-row">
-            <h4>التحليل المعزز</h4>
-            <HelpHint text="تفاصيل إضافية من المراجعة اللغوية تظهر عند الحاجة فقط. افتح أي قسم للاطلاع على التفاصيل." />
+            <h4>المراجعة المساندة</h4>
+            <HelpHint text="يعرض هذا القسم خلاصات داعمة للمراجع، بينما تبقى التفاصيل الطويلة ضمن أقسام قابلة للتوسيع عند الحاجة." />
           </div>
           <div className="llm-metrics">
             <div className="detail-card llm-decision-card">
@@ -660,7 +1459,10 @@ function LlmSupportContent({
               <strong>{review.confidence}%</strong>
             </div>
             <div className="detail-card">
-              <span>الموديل المستخدم</span>
+              <span className="ai-model-label">
+                <AiAnalysisIcon className="ai-analysis-icon-xs" />
+                <span>المحرك المستخدم</span>
+              </span>
               <strong>{review.model}</strong>
             </div>
           </div>
@@ -669,6 +1471,8 @@ function LlmSupportContent({
           <small className="llm-timestamp">
             آخر توليد: {new Date(review.generatedAt).toLocaleString("ar-SA")}
           </small>
+
+          <ComplianceReportSection review={review} />
 
           <div className="llm-disclosures">
             <SmartDisclosure
@@ -764,38 +1568,84 @@ export default function App() {
   const [viewMode, setViewMode] = useState<ViewMode>("office");
   const [policyId, setPolicyId] = useState(defaultPolicyId);
   const [form, setForm] = useState<SubmissionForm>(emptyForm);
-  const [applications, setApplications] = useState<ApplicationRecord[]>(() =>
-    loadStoredApplications(),
-  );
-  const [selectedApplicationId, setSelectedApplicationId] = useState(() =>
-    loadStoredSelectedApplicationId(),
-  );
-  const [isAnalyzing, setIsAnalyzing] = useState(false);
+  const [applications, setApplications] = useState<ApplicationRecord[]>([]);
+  const [selectedApplicationId, setSelectedApplicationId] = useState("");
+  const [uploadingDocuments, setUploadingDocuments] = useState<string[]>([]);
+  const [bulkUploadPreview, setBulkUploadPreview] = useState<
+    BulkUploadPreviewItem[] | null
+  >(null);
+  const [bulkUploadPreviewError, setBulkUploadPreviewError] = useState("");
+  const [isConfirmingBulkUpload, setIsConfirmingBulkUpload] = useState(false);
   const [analysisTrace, setAnalysisTrace] = useState<
     AttachmentAnalysisTraceEvent[]
   >([]);
   const [analysisError, setAnalysisError] = useState("");
   const [submitError, setSubmitError] = useState("");
   const [copyStatus, setCopyStatus] = useState("");
-  const [previewState, setPreviewState] = useState<SourcePreviewState | null>(
-    null,
-  );
+  const [previewState, setPreviewState] = useState<PreviewState | null>(null);
   const [previewLoading, setPreviewLoading] = useState(false);
   const [previewError, setPreviewError] = useState("");
+  const trackedPreviewUrlsRef = useRef<Set<string>>(new Set());
   const lastDraftAutoReviewKey = useRef("");
   const lastApplicationAutoReviewKey = useRef("");
 
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+
+    LEGACY_STORAGE_KEYS.forEach((storageKey) => {
+      window.localStorage.removeItem(storageKey);
+    });
+
+    for (let index = window.localStorage.length - 1; index >= 0; index -= 1) {
+      const storageKey = window.localStorage.key(index);
+      if (storageKey?.startsWith(LEGACY_ATTACHMENT_CACHE_PREFIX)) {
+        window.localStorage.removeItem(storageKey);
+      }
+    }
+  }, []);
+
   const activePolicy =
     policies.find((item) => item.id === policyId) ?? policies[0];
-  const draftReview = reviewApplication(activePolicy, form);
+  const activeScopedPolicy = buildPolicyWithResolvedDocuments(
+    activePolicy,
+    form.projectTypeGroupId,
+    form.projectSubtypeId,
+  );
+  const activeProjectTypeGroups = getProjectTypeGroups(activePolicy);
+  const activeProjectTypeGroup = getSelectedProjectTypeGroup(
+    activePolicy,
+    form.projectTypeGroupId,
+  );
+  const draftReview = reviewApplication(activeScopedPolicy, form);
   const selectedApplication =
     applications.find((item) => item.id === selectedApplicationId) ??
     applications[0] ??
     null;
-  const submissionValidationErrors = getSubmissionValidationErrors(form);
+  const submissionValidationErrors = getSubmissionValidationErrors(
+    form,
+    activeScopedPolicy,
+  );
+  const requiresProjectSubtypeSelection = activeProjectTypeGroups.length > 0;
+  const canUploadFiles =
+    !requiresProjectSubtypeSelection ||
+    Boolean(form.projectTypeGroupId && form.projectSubtypeId);
+  const isAnalyzing = uploadingDocuments.length > 0;
+  const hasBulkUploadPreview =
+    bulkUploadPreview !== null && bulkUploadPreview.length > 0;
+  const uploadLockMessage = !requiresProjectSubtypeSelection
+    ? ""
+    : !form.projectTypeGroupId
+      ? "اختر نوع المشروع أولاً قبل رفع أي ملف."
+      : !form.projectSubtypeId
+        ? "اختر التصنيف التفصيلي للمشروع قبل رفع أي ملف."
+        : "";
   const canSubmit = submissionValidationErrors.length === 0 && !isAnalyzing;
   const hasUploadedFiles = form.uploadedAttachments.length > 0;
   const previewSourceName = previewState?.fileName ?? "";
+  const previewSourceLabel =
+    previewState?.sourceLabel ?? "معاينة مباشرة لملف المصدر";
 
   const draftLlmMutation = useMutation({
     mutationFn: requestLlmReview,
@@ -813,8 +1663,13 @@ export default function App() {
       const policy =
         policies.find((item) => item.id === application.policyId) ??
         policies[0];
-      const review = await requestLlmReview({
+      const scopedPolicy = buildPolicyWithResolvedDocuments(
         policy,
+        application.projectTypeGroupId ?? "",
+        application.projectSubtypeId ?? "",
+      );
+      const review = await requestLlmReview({
+        policy: scopedPolicy,
         submission: buildSubmissionFromApplication(application),
         ruleReview: application.review,
       });
@@ -836,10 +1691,26 @@ export default function App() {
     draftLlmMutation.data,
     draftReview.documentValidations,
   );
+  const draftValidatedDocuments = getValidatedDocumentNames(
+    draftDisplayValidations,
+  );
   const selectedDisplayValidations = selectedApplication
     ? selectDocumentValidations(
         selectedApplication.llmReview,
         selectedApplication.review.documentValidations,
+      )
+    : [];
+  const selectedValidatedDocuments = getValidatedDocumentNames(
+    selectedDisplayValidations,
+  );
+  const draftAttachmentReviews = buildAttachmentReviewCollection(
+    form.uploadedAttachments,
+    draftDisplayValidations,
+  );
+  const selectedAttachmentReviews = selectedApplication
+    ? buildAttachmentReviewCollection(
+        selectedApplication.uploadedAttachments,
+        selectedDisplayValidations,
       )
     : [];
   const selectedSuggestedResponses = selectedApplication
@@ -858,35 +1729,93 @@ export default function App() {
     setForm((current) => ({ ...current, [field]: value }));
   }
 
+  function clearBulkUploadPreview() {
+    setBulkUploadPreview(null);
+    setBulkUploadPreviewError("");
+    setIsConfirmingBulkUpload(false);
+  }
+
   function handlePolicyChange(nextPolicyId: string) {
     const nextPolicy =
       policies.find((item) => item.id === nextPolicyId) ?? policies[0];
+    const defaultProjectTypeGroupId = nextPolicy.projectTypes?.[0]?.id ?? "";
+    const defaultProjectSubtypeId =
+      nextPolicy.projectTypes?.[0]?.subtypes?.[0]?.id ?? "";
     setPolicyId(nextPolicy.id);
     draftLlmMutation.reset();
     setSubmitError("");
+    clearBulkUploadPreview();
     setForm((current) => ({
       ...current,
+      projectTypeGroupId: defaultProjectTypeGroupId,
+      projectSubtypeId: defaultProjectSubtypeId,
       selectedDocuments: collectDetectedDocuments(
         current.uploadedAttachments,
-        nextPolicy,
+        buildPolicyWithResolvedDocuments(
+          nextPolicy,
+          defaultProjectTypeGroupId,
+          defaultProjectSubtypeId,
+        ),
       ),
     }));
   }
 
-  async function handleFileSelection(fileList: FileList | null) {
-    if (!fileList || fileList.length === 0) {
-      return;
-    }
-
-    setIsAnalyzing(true);
+  function handleProjectTypeGroupChange(nextProjectTypeGroupId: string) {
+    const nextProjectSubtypeId =
+      getSelectedProjectTypeGroup(activePolicy, nextProjectTypeGroupId)
+        ?.subtypes[0]?.id ?? "";
+    draftLlmMutation.reset();
     setAnalysisError("");
     setSubmitError("");
-    setAnalysisTrace([]);
+    clearBulkUploadPreview();
+    setForm((current) => ({
+      ...current,
+      projectTypeGroupId: nextProjectTypeGroupId,
+      projectSubtypeId: nextProjectSubtypeId,
+      uploadedAttachments: [],
+      selectedDocuments: [],
+    }));
+  }
+
+  function handleProjectSubtypeChange(nextProjectSubtypeId: string) {
+    draftLlmMutation.reset();
+    setAnalysisError("");
+    setSubmitError("");
+    clearBulkUploadPreview();
+    const nextScopedPolicy = buildPolicyWithResolvedDocuments(
+      activePolicy,
+      form.projectTypeGroupId,
+      nextProjectSubtypeId,
+    );
+    setForm((current) => ({
+      ...current,
+      projectSubtypeId: nextProjectSubtypeId,
+      uploadedAttachments: current.uploadedAttachments.filter(
+        (attachment) =>
+          !attachment.requiredDocument ||
+          nextScopedPolicy.requiredDocuments.includes(
+            attachment.requiredDocument,
+          ),
+      ),
+      selectedDocuments: current.selectedDocuments.filter((documentName) =>
+        nextScopedPolicy.requiredDocuments.includes(documentName),
+      ),
+    }));
+  }
+
+  async function uploadFileForDocument(documentName: string, file: File) {
+    setUploadingDocuments((current) =>
+      current.includes(documentName) ? current : [...current, documentName],
+    );
+    setSubmitError("");
     draftLlmMutation.reset();
 
     try {
-      const files = Array.from(fileList);
-      const analyzed = await analyzeAttachments(files, activePolicy, {
+      const focusedPolicy = {
+        ...activeScopedPolicy,
+        requiredDocuments: [documentName],
+      };
+      const analyzed = await analyzeAttachments([file], focusedPolicy, {
         onProgress: (event) => {
           setAnalysisTrace((current) => {
             if (!event.operationKey) {
@@ -912,53 +1841,211 @@ export default function App() {
       });
 
       setForm((current) => {
-        const existingById = new Map(
-          current.uploadedAttachments.map((attachment) => [
-            attachment.id,
-            attachment,
-          ]),
-        );
-        analyzed.forEach((attachment) => {
-          existingById.set(attachment.id, attachment);
-        });
-        const uploadedAttachments = Array.from(existingById.values());
+        const replacement = analyzed.map((attachment) => ({
+          ...attachment,
+          requiredDocument: documentName,
+        }));
+        const uploadedAttachments = [
+          ...current.uploadedAttachments.filter(
+            (attachment) => attachment.requiredDocument !== documentName,
+          ),
+          ...replacement,
+        ];
         return {
           ...current,
           uploadedAttachments,
           selectedDocuments: collectDetectedDocuments(
             uploadedAttachments,
-            activePolicy,
+            activeScopedPolicy,
           ),
         };
       });
+
+      return { ok: true as const };
     } catch (error) {
       const message =
         error instanceof Error ? error.message : "فشل تحليل الملفات المرفوعة.";
-      setAnalysisError(message);
+      return { ok: false as const, message };
     } finally {
-      setIsAnalyzing(false);
+      setUploadingDocuments((current) =>
+        current.filter((item) => item !== documentName),
+      );
     }
   }
 
-  function removeAttachment(attachmentId: string) {
+  async function handleFileSelection(
+    documentName: string,
+    fileList: FileList | null,
+  ) {
+    if (!fileList || fileList.length === 0) {
+      return;
+    }
+
+    if (!canUploadFiles) {
+      setAnalysisError(
+        uploadLockMessage ||
+          "يجب اختيار نوع المشروع والتصنيف التفصيلي قبل رفع الملفات.",
+      );
+      return;
+    }
+
+    setAnalysisError("");
+    clearBulkUploadPreview();
+    const file = fileList[0];
+    if (!file) {
+      return;
+    }
+
+    const result = await uploadFileForDocument(documentName, file);
+    if (!result.ok) {
+      setAnalysisError(result.message);
+    }
+  }
+
+  async function handleBulkFileSelection(fileList: FileList | null) {
+    if (!fileList || fileList.length === 0) {
+      return;
+    }
+
+    if (!canUploadFiles) {
+      setAnalysisError(
+        uploadLockMessage ||
+          "يجب اختيار نوع المشروع والتصنيف التفصيلي قبل رفع الملفات.",
+      );
+      return;
+    }
+
+    const files = Array.from(fileList);
+    setAnalysisError("");
+    setSubmitError("");
+    draftLlmMutation.reset();
+
+    const previewItems = buildBulkUploadPreviewItems(
+      files,
+      activeScopedPolicy.requiredDocuments,
+    );
+    setBulkUploadPreview(previewItems);
+    setBulkUploadPreviewError(
+      previewItems.some((item) => item.selectedDocumentName)
+        ? ""
+        : "لم يتم العثور على أي تطابق واضح تلقائياً. يمكنك تعيين المستندات يدوياً ثم بدء الرفع.",
+    );
+  }
+
+  function updateBulkUploadPreviewSelection(
+    previewItemId: string,
+    nextDocumentName: string,
+  ) {
+    setBulkUploadPreview((current) => {
+      if (!current) {
+        return current;
+      }
+
+      return current.map((item) => {
+        if (item.id === previewItemId) {
+          return {
+            ...item,
+            selectedDocumentName: nextDocumentName,
+          };
+        }
+
+        if (
+          nextDocumentName &&
+          item.selectedDocumentName === nextDocumentName
+        ) {
+          return {
+            ...item,
+            selectedDocumentName: "",
+          };
+        }
+
+        return item;
+      });
+    });
+    setBulkUploadPreviewError("");
+  }
+
+  async function confirmBulkUploadPreview() {
+    if (!bulkUploadPreview || bulkUploadPreview.length === 0) {
+      return;
+    }
+
+    const assignments = bulkUploadPreview.filter(
+      (item) => item.selectedDocumentName,
+    );
+
+    if (assignments.length === 0) {
+      setBulkUploadPreviewError(
+        "اختر مستنداً واحداً على الأقل من المعاينة قبل بدء الرفع.",
+      );
+      return;
+    }
+
+    setBulkUploadPreviewError("");
+    setAnalysisError("");
+    setSubmitError("");
+    setIsConfirmingBulkUpload(true);
+
+    const uploadFailures: string[] = [];
+    const skippedFiles = bulkUploadPreview
+      .filter((item) => !item.selectedDocumentName)
+      .map((item) => item.file.name);
+
+    try {
+      for (const assignment of assignments) {
+        const result = await uploadFileForDocument(
+          assignment.selectedDocumentName,
+          assignment.file,
+        );
+        if (!result.ok) {
+          uploadFailures.push(`${assignment.file.name}: ${result.message}`);
+        }
+      }
+
+      const messages: string[] = [];
+      if (skippedFiles.length > 0) {
+        messages.push(
+          `تم ترك هذه الملفات بدون رفع ضمن هذه الدفعة: ${skippedFiles.join("، ")}.`,
+        );
+      }
+      if (uploadFailures.length > 0) {
+        messages.push(`فشل تحليل بعض الملفات: ${uploadFailures.join("، ")}.`);
+      }
+
+      if (messages.length > 0) {
+        setAnalysisError(messages.join(" "));
+      }
+
+      clearBulkUploadPreview();
+    } finally {
+      setIsConfirmingBulkUpload(false);
+    }
+  }
+
+  function removeAttachment(documentName: string) {
     draftLlmMutation.reset();
     setSubmitError("");
+    clearBulkUploadPreview();
     setForm((current) => {
       const uploadedAttachments = current.uploadedAttachments.filter(
-        (attachment) => attachment.id !== attachmentId,
+        (attachment) => attachment.requiredDocument !== documentName,
       );
       return {
         ...current,
         uploadedAttachments,
         selectedDocuments: collectDetectedDocuments(
           uploadedAttachments,
-          activePolicy,
+          activeScopedPolicy,
         ),
       };
     });
   }
 
   useEffect(() => {
+    if (!ENABLE_DRAFT_LLM_REVIEW) {
+      return;
+    }
+
     const hasMinimumDraftContext =
       form.uploadedAttachments.length > 0 &&
       form.projectDescription.trim().length >= 20 &&
@@ -971,6 +2058,8 @@ export default function App() {
 
     const nextKey = JSON.stringify({
       policyId: activePolicy.id,
+      projectTypeGroupId: form.projectTypeGroupId,
+      projectSubtypeId: form.projectSubtypeId,
       selectedDocuments: form.selectedDocuments,
       attachments: form.uploadedAttachments.map((attachment) => ({
         id: attachment.id,
@@ -991,14 +2080,14 @@ export default function App() {
     const timeoutId = window.setTimeout(() => {
       lastDraftAutoReviewKey.current = nextKey;
       draftLlmMutation.mutate({
-        policy: activePolicy,
+        policy: activeScopedPolicy,
         submission: form,
         ruleReview: draftReview,
       });
     }, 1200);
 
     return () => window.clearTimeout(timeoutId);
-  }, [activePolicy, draftLlmMutation, draftReview, form]);
+  }, [activeScopedPolicy, draftLlmMutation, draftReview, form]);
 
   useEffect(() => {
     if (
@@ -1011,6 +2100,8 @@ export default function App() {
 
     const nextKey = JSON.stringify({
       applicationId: selectedApplication.id,
+      projectTypeGroupId: selectedApplication.projectTypeGroupId ?? "",
+      projectSubtypeId: selectedApplication.projectSubtypeId ?? "",
       selectedDocuments: selectedApplication.selectedDocuments,
       attachments: selectedApplication.uploadedAttachments.map(
         (attachment) => ({
@@ -1046,33 +2137,6 @@ export default function App() {
       setSelectedApplicationId(applications[0].id);
     }
   }, [applications, selectedApplicationId]);
-
-  useEffect(() => {
-    if (typeof window === "undefined") {
-      return;
-    }
-
-    window.localStorage.setItem(
-      APPLICATIONS_STORAGE_KEY,
-      JSON.stringify(applications),
-    );
-  }, [applications]);
-
-  useEffect(() => {
-    if (typeof window === "undefined") {
-      return;
-    }
-
-    if (selectedApplicationId) {
-      window.localStorage.setItem(
-        SELECTED_APPLICATION_STORAGE_KEY,
-        selectedApplicationId,
-      );
-      return;
-    }
-
-    window.localStorage.removeItem(SELECTED_APPLICATION_STORAGE_KEY);
-  }, [selectedApplicationId]);
 
   async function copyOfficeReply(application: ApplicationRecord) {
     const policy =
@@ -1114,6 +2178,7 @@ export default function App() {
       setPreviewState({
         path,
         ...payload,
+        sourceLabel: "معاينة مباشرة لملف المصدر",
         url: payload.url ? resolveApiUrl(payload.url) : undefined,
       });
     } catch (error) {
@@ -1124,6 +2189,7 @@ export default function App() {
         path,
         fileName: getFileNameFromPath(path),
         kind: "unsupported",
+        sourceLabel: "معاينة مباشرة لملف المصدر",
         message,
       });
     } finally {
@@ -1136,6 +2202,54 @@ export default function App() {
     setPreviewLoading(false);
     setPreviewError("");
   }
+
+  function openAttachmentPreview(attachment: UploadedAttachment) {
+    if (!attachment.preview) {
+      return;
+    }
+
+    setPreviewLoading(false);
+    setPreviewError("");
+    setPreviewState({
+      fileName: attachment.preview.fileName,
+      kind: attachment.preview.kind,
+      sourceLabel: "معاينة الملف المرفوع",
+      url: attachment.preview.url,
+      html: attachment.preview.html,
+      message: attachment.preview.message,
+    });
+  }
+
+  useEffect(() => {
+    const nextPreviewUrls = new Set<string>();
+    const allUploadedAttachments = [
+      ...form.uploadedAttachments,
+      ...applications.flatMap((application) => application.uploadedAttachments),
+    ];
+
+    allUploadedAttachments.forEach((attachment) => {
+      if (attachment.preview?.revokeObjectUrl && attachment.preview.url) {
+        nextPreviewUrls.add(attachment.preview.url);
+      }
+    });
+
+    trackedPreviewUrlsRef.current.forEach((previewUrl) => {
+      if (!nextPreviewUrls.has(previewUrl)) {
+        URL.revokeObjectURL(previewUrl);
+      }
+    });
+
+    trackedPreviewUrlsRef.current = nextPreviewUrls;
+  }, [applications, form.uploadedAttachments]);
+
+  useEffect(() => {
+    return () => {
+      trackedPreviewUrlsRef.current.forEach((previewUrl) => {
+        URL.revokeObjectURL(previewUrl);
+      });
+      trackedPreviewUrlsRef.current = new Set();
+    };
+  }, []);
 
   function submitApplication() {
     if (!canSubmit) {
@@ -1154,6 +2268,8 @@ export default function App() {
       officeName: form.officeName,
       district: form.district,
       plotNumber: form.plotNumber,
+      projectTypeGroupId: form.projectTypeGroupId,
+      projectSubtypeId: form.projectSubtypeId,
       projectDescription: form.projectDescription,
       selectedDocuments: form.selectedDocuments,
       comments: form.comments,
@@ -1172,44 +2288,45 @@ export default function App() {
     lastDraftAutoReviewKey.current = "";
   }
 
-  const readyCount = applications.filter(
-    (item) => item.review.status === "ready",
-  ).length;
-  const blockedCount = applications.filter(
-    (item) => item.review.status === "blocked",
-  ).length;
-
   return (
     <div className="app-shell">
       <section className="top-strip">
         <div className="top-strip-title">أمانة منطقة الرياض</div>
         <div className="top-strip-meta">
-          <span>منصة داخلية لمراجعة الرخص الهندسية</span>
+          <span>منصة تشغيل داخلية لمراجعة الرخص الهندسية</span>
           <span>الرياض</span>
         </div>
       </section>
 
       <header className="hero-card">
-        <div>
-          <div className="brand-lockup">
-            <img
-              className="brand-logo"
-              src="https://www.alriyadh.gov.sa/images/logo.png"
-              alt="شعار أمانة منطقة الرياض"
-            />
-            <div className="brand-copy">
-              <span className="brand-badge">مراجعة واستقبال الطلبات</span>
-              <span className="eyebrow">
-                النموذج الأولي الذكي لأمانة الرياض
-              </span>
+        <div className="hero-content">
+          <div className="hero-heading-row">
+            <div className="hero-title-block">
+              <h1>
+                منصة إثبات مفهوم لاعتماد رخص البناء بمساعدة الذكاء الاصطناعي
+              </h1>
+              <div className="hero-tag-row">
+                <span className="brand-badge">استقبال ومراجعة الطلبات</span>
+                <span className="eyebrow">تشغيل موحد لفرق المكتب والأمانة</span>
+              </div>
+            </div>
+            <div className="hero-logo-shell">
+              <img
+                className="brand-logo"
+                src="https://www.alriyadh.gov.sa/images/logo.png"
+                alt="شعار أمانة منطقة الرياض"
+              />
             </div>
           </div>
-          <h1>
-            منصة إثبات مفهوم لاعتماد الرخص الهندسية بمساعدة الذكاء الاصطناعي
-          </h1>
+          <div className="brand-copy">
+            <span className="hero-kicker">أمانة منطقة الرياض</span>
+            <span className="hero-subtitle">
+              تشغيل موحد لرحلة المكتب والأمانة من الاستقبال حتى الاعتماد
+            </span>
+          </div>
           <p>
-            توحيد استقبال الطلبات الهندسية، فحص المرفقات، واستخراج مؤشرات
-            الجاهزية قبل الإحالة إلى المراجع البلدي المختص.
+            توحيد استقبال الطلبات الهندسية، فحص المرفقات، وإبراز مؤشرات الاكتمال
+            والمخاطر قبل الإحالة إلى المراجع البلدي المختص.
           </p>
           <ProcessStrip
             steps={
@@ -1220,20 +2337,6 @@ export default function App() {
             activeIndex={viewMode === "office" ? 2 : 1}
           />
         </div>
-        <div className="hero-metrics">
-          <div className="metric-card">
-            <strong>12</strong>
-            <span>سياسة مرجعية</span>
-          </div>
-          <div className="metric-card">
-            <strong>{readyCount}</strong>
-            <span>ملفات جاهزة للاعتماد</span>
-          </div>
-          <div className="metric-card warning">
-            <strong>{blockedCount}</strong>
-            <span>ملفات متوقفة</span>
-          </div>
-        </div>
       </header>
 
       <section className="toolbar">
@@ -1242,18 +2345,18 @@ export default function App() {
             className={viewMode === "office" ? "active" : ""}
             onClick={() => setViewMode("office")}
           >
-            طبقة المكتب الهندسي
+            واجهة المكتب الهندسي
           </button>
           <button
             className={viewMode === "municipality" ? "active" : ""}
             onClick={() => setViewMode("municipality")}
           >
-            طبقة الأمانة والمراجعة
+            واجهة الأمانة والمراجعة
           </button>
         </div>
         <div className="legend-row">
           <span>المصدر</span>
-          <HelpHint text="المراجعة تعتمد على لوائح ونماذج عربية فعلية مع تحليل الملفات المرفوعة محلياً ثم دعم لغوي إضافي عند الحاجة." />
+          <HelpHint text="المراجعة تستند إلى لوائح ونماذج عربية فعلية مع قراءة للمرفقات المرفوعة وربطها بالمرجع المناسب عند الحاجة." />
         </div>
       </section>
 
@@ -1263,11 +2366,11 @@ export default function App() {
             <div className="panel-header">
               <div className="section-title-row">
                 <h2>إعداد الطلب</h2>
-                <HelpHint text="ابدأ بالبيانات الأساسية ثم ارفع ملفاً فعلياً واحداً على الأقل ليبدأ التحليل والمقارنة مع السياسة." />
+                <HelpHint text="ابدأ بالبيانات الأساسية ثم ارفع ملفاً فعلياً واحداً على الأقل ليبدأ الفحص وربط المرفقات بمتطلبات السياسة." />
               </div>
               <p>
-                املأ البيانات الأساسية وارفع الملفات. بقية التفاصيل تظهر عند
-                الحاجة فقط.
+                املأ البيانات الأساسية وارفع الملفات، ثم راجع مؤشرات الاكتمال
+                قبل الإرسال.
               </p>
             </div>
 
@@ -1285,241 +2388,628 @@ export default function App() {
               </select>
             </label>
 
-            <div className="grid-two">
-              <label className="field">
-                <span>اسم المستفيد</span>
-                <input
-                  value={form.applicantName}
-                  onChange={(event) =>
-                    updateField("applicantName", event.target.value)
-                  }
-                />
-              </label>
-              <label className="field">
-                <span>الهوية / السجل</span>
-                <input
-                  value={form.nationalId}
-                  onChange={(event) =>
-                    updateField("nationalId", event.target.value)
-                  }
-                />
-              </label>
-              <label className="field">
-                <span>المكتب الهندسي</span>
-                <input
-                  value={form.officeName}
-                  onChange={(event) =>
-                    updateField("officeName", event.target.value)
-                  }
-                />
-              </label>
-              <label className="field">
-                <span>رقم ترخيص المكتب</span>
-                <input
-                  value={form.officeLicense}
-                  onChange={(event) =>
-                    updateField("officeLicense", event.target.value)
-                  }
-                />
-              </label>
-              <label className="field">
-                <span>الجوال</span>
-                <input
-                  value={form.mobile}
-                  onChange={(event) =>
-                    updateField("mobile", event.target.value)
-                  }
-                />
-              </label>
-              <label className="field">
-                <span>الحي</span>
-                <input
-                  value={form.district}
-                  onChange={(event) =>
-                    updateField("district", event.target.value)
-                  }
-                />
-              </label>
-              <label className="field field-span">
-                <span>رقم القطعة / المخطط</span>
-                <input
-                  value={form.plotNumber}
-                  onChange={(event) =>
-                    updateField("plotNumber", event.target.value)
-                  }
-                />
-              </label>
+            {activeProjectTypeGroups.length > 0 ? (
+              <div className="grid-two">
+                <label className="field">
+                  <span>نوع المشروع</span>
+                  <select
+                    value={form.projectTypeGroupId}
+                    onChange={(event) =>
+                      handleProjectTypeGroupChange(event.target.value)
+                    }
+                  >
+                    <option value="">اختر نوع المشروع</option>
+                    {activeProjectTypeGroups.map((group) => (
+                      <option key={group.id} value={group.id}>
+                        {group.title}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+
+                <label className="field">
+                  <span>التصنيف التفصيلي للمشروع</span>
+                  <select
+                    value={form.projectSubtypeId}
+                    onChange={(event) =>
+                      handleProjectSubtypeChange(event.target.value)
+                    }
+                    disabled={!activeProjectTypeGroup}
+                  >
+                    <option value="">
+                      {activeProjectTypeGroup
+                        ? "اختر التصنيف التفصيلي"
+                        : "اختر نوع المشروع أولاً"}
+                    </option>
+                    {(activeProjectTypeGroup?.subtypes ?? []).map((subtype) => (
+                      <option key={subtype.id} value={subtype.id}>
+                        {subtype.title}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              </div>
+            ) : null}
+
+            {activeProjectTypeGroups.length > 0 ? (
+              <div className="review-card compact-note tone-neutral">
+                <h3>تصنيف المشروع المعتمد للمراجعة</h3>
+                <p>
+                  {buildProjectTypeSummary(
+                    activePolicy,
+                    form.projectTypeGroupId,
+                    form.projectSubtypeId,
+                  )}
+                </p>
+                <small>
+                  عدد المرفقات المطلوبة لهذا التصنيف:{" "}
+                  {activeScopedPolicy.requiredDocuments.length}
+                </small>
+              </div>
+            ) : null}
+
+            <div className="review-card compact-card tone-neutral">
+              <SmartDisclosure title="البيانات الأساسية للطلب">
+                <div className="grid-two">
+                  <label className="field">
+                    <span>اسم المستفيد</span>
+                    <input
+                      value={form.applicantName}
+                      onChange={(event) =>
+                        updateField("applicantName", event.target.value)
+                      }
+                    />
+                  </label>
+                  <label className="field">
+                    <span>الهوية / السجل</span>
+                    <input
+                      value={form.nationalId}
+                      onChange={(event) =>
+                        updateField("nationalId", event.target.value)
+                      }
+                    />
+                  </label>
+                  <label className="field">
+                    <span>المكتب الهندسي</span>
+                    <input
+                      value={form.officeName}
+                      onChange={(event) =>
+                        updateField("officeName", event.target.value)
+                      }
+                    />
+                  </label>
+                  <label className="field">
+                    <span>رقم ترخيص المكتب</span>
+                    <input
+                      value={form.officeLicense}
+                      onChange={(event) =>
+                        updateField("officeLicense", event.target.value)
+                      }
+                    />
+                  </label>
+                  <label className="field">
+                    <span>الجوال</span>
+                    <input
+                      value={form.mobile}
+                      onChange={(event) =>
+                        updateField("mobile", event.target.value)
+                      }
+                    />
+                  </label>
+                  <label className="field">
+                    <span>الحي</span>
+                    <input
+                      value={form.district}
+                      onChange={(event) =>
+                        updateField("district", event.target.value)
+                      }
+                    />
+                  </label>
+                  <label className="field field-span">
+                    <span>رقم القطعة / المخطط</span>
+                    <input
+                      value={form.plotNumber}
+                      onChange={(event) =>
+                        updateField("plotNumber", event.target.value)
+                      }
+                    />
+                  </label>
+                </div>
+
+                <label className="field">
+                  <span>وصف المشروع</span>
+                  <textarea
+                    rows={4}
+                    value={form.projectDescription}
+                    onChange={(event) =>
+                      updateField("projectDescription", event.target.value)
+                    }
+                  />
+                </label>
+
+                <label className="field">
+                  <span>ملاحظات المكتب للأمانة</span>
+                  <textarea
+                    rows={3}
+                    value={form.comments}
+                    onChange={(event) =>
+                      updateField("comments", event.target.value)
+                    }
+                  />
+                </label>
+              </SmartDisclosure>
             </div>
 
-            <label className="field">
-              <span>وصف المشروع</span>
-              <textarea
-                rows={4}
-                value={form.projectDescription}
-                onChange={(event) =>
-                  updateField("projectDescription", event.target.value)
-                }
-              />
-            </label>
-
-            <label className="field">
-              <span>ملاحظات المكتب للبلدية أو نظام الذكاء الاصطناعي</span>
-              <textarea
-                rows={3}
-                value={form.comments}
-                onChange={(event) =>
-                  updateField("comments", event.target.value)
-                }
-              />
-            </label>
-
             <div className="panel-subsection">
-              <div className="subsection-heading">
-                <h3>الملفات المرفوعة والتحليل الفعلي</h3>
-                <span>
-                  {form.selectedDocuments.length} /{" "}
-                  {activePolicy.requiredDocuments.length}
-                </span>
-              </div>
-              <label className="upload-dropzone">
-                <input
-                  type="file"
-                  multiple
-                  accept=".pdf,.docx,.txt,.json,.md,.png,.jpg,.jpeg,.webp"
-                  onChange={(event) => {
-                    void handleFileSelection(event.target.files);
-                    event.target.value = "";
-                  }}
-                />
-                <strong>إرفاق ملفات حقيقية للتحليل</strong>
-                <span>
-                  الأنواع المدعومة حالياً: PDF, DOCX, TXT, JSON, PNG, JPG, WebP.
-                </span>
-                <small>
-                  يتم تحليل النص داخل الملفات محلياً في المتصفح. OCR للصور قد
-                  يستغرق وقتاً أطول.
-                </small>
-              </label>
-              {isAnalyzing ? (
-                <AnalysisTracePanel
-                  message="جاري قراءة وتحليل الملفات المرفوعة..."
-                  events={analysisTrace}
-                  active={isAnalyzing}
-                />
-              ) : null}
-              {analysisError ? (
-                <div className="upload-status error">{analysisError}</div>
-              ) : null}
-              {!isAnalyzing && analysisTrace.length > 0 ? (
-                <details className="analysis-trace-panel analysis-trace-panel-resting">
-                  <summary>
-                    <span>آخر مسار تحليل</span>
-                    <strong>{analysisTrace.length}</strong>
-                  </summary>
-                  <div className="analysis-trace-meta">
-                    <span>
-                      يمكنك مراجعة ما الذي قرأه النظام وكيف مرّت دفعات الذكاء
-                      الاصطناعي على الملفات.
-                    </span>
-                  </div>
-                  <div className="analysis-trace-list">
-                    {analysisTrace.map((event) => (
-                      <article
-                        key={event.id}
-                        className={`analysis-trace-item ${event.status}`}
-                      >
-                        <div className="analysis-trace-header">
-                          <strong>{event.title}</strong>
-                          <span>{event.fileName ?? event.phase}</span>
-                        </div>
-                        <p>{event.detail}</p>
-                        {event.detectedDocuments &&
-                        event.detectedDocuments.length > 0 ? (
-                          <div className="analysis-trace-tags">
-                            {event.detectedDocuments.map((documentName) => (
+              <SmartDisclosure
+                title="الملفات المرفوعة ونتيجة الفحص"
+                count={`${form.selectedDocuments.length} / ${activeScopedPolicy.requiredDocuments.length}`}
+                defaultOpen
+              >
+                <div className="review-card compact-note tone-neutral">
+                  <h3>رفع ملف مستقل لكل متطلب</h3>
+                  <p>
+                    لكل مستند مطلوب خانة رفع منفصلة. سيجري فحص الملف المرفوع
+                    داخل هذه الخانة مقابل هذا المتطلب فقط، ثم تُعرض لك خلاصة
+                    واضحة عن مدى مناسبته.
+                  </p>
+                  {canUploadFiles ? (
+                    <label
+                      className={`secondary-button bulk-upload-button${isAnalyzing || isConfirmingBulkUpload ? " is-disabled" : ""}`}
+                      aria-disabled={isAnalyzing || isConfirmingBulkUpload}
+                    >
+                      <input
+                        type="file"
+                        multiple
+                        accept=".pdf,.docx,.txt,.json,.md,.png,.jpg,.jpeg,.webp"
+                        disabled={isAnalyzing || isConfirmingBulkUpload}
+                        onChange={(event) => {
+                          void handleBulkFileSelection(event.target.files);
+                          event.target.value = "";
+                        }}
+                      />
+                      مراجعة دفعة ملفات قبل رفعها وتوزيعها
+                    </label>
+                  ) : null}
+                  <small>
+                    {canUploadFiles
+                      ? "الأنواع المدعومة: PDF, DOCX, TXT, JSON, PNG, JPG, WebP. بعد اختيار الدفعة ستظهر معاينة توضح ربط كل ملف بالمتطلب المقترح مع إمكانية إعادة التوزيع يدوياً قبل بدء الرفع."
+                      : uploadLockMessage}
+                  </small>
+                </div>
+                {hasBulkUploadPreview ? (
+                  <div className="review-card bulk-preview-card">
+                    <div className="bulk-preview-header">
+                      <div>
+                        <h3>معاينة دفعة الرفع قبل البدء</h3>
+                        <p>
+                          راجع ربط كل ملف بالمستند المطلوب. يمكن تعديل أي ملف
+                          يدوياً، وعند اختيار نفس المتطلب لملف جديد سيتم نقله من
+                          الملف السابق داخل هذه الدفعة.
+                        </p>
+                      </div>
+                      <div className="bulk-preview-summary">
+                        <strong>
+                          {
+                            bulkUploadPreview.filter(
+                              (item) => item.selectedDocumentName,
+                            ).length
+                          }
+                        </strong>
+                        <span>جاهز للرفع</span>
+                      </div>
+                    </div>
+
+                    {bulkUploadPreviewError ? (
+                      <div className="upload-status error">
+                        {bulkUploadPreviewError}
+                      </div>
+                    ) : null}
+
+                    <div className="bulk-preview-list">
+                      {bulkUploadPreview.map((item) => {
+                        const selectedAttachment = item.selectedDocumentName
+                          ? getAttachmentForRequiredDocument(
+                              form.uploadedAttachments,
+                              item.selectedDocumentName,
+                            )
+                          : undefined;
+                        const selectedLabel = item.selectedDocumentName
+                          ? formatChecklistDocumentLabel(
+                              item.selectedDocumentName,
+                            )
+                          : "لم يتم التعيين بعد";
+                        const isManualSelection =
+                          Boolean(item.selectedDocumentName) &&
+                          item.selectedDocumentName !==
+                            item.suggestedDocumentName;
+
+                        return (
+                          <article key={item.id} className="bulk-preview-row">
+                            <div className="bulk-preview-row-main">
+                              <div>
+                                <strong>{item.file.name}</strong>
+                                <span>
+                                  {Math.max(
+                                    1,
+                                    Math.round(item.file.size / 1024),
+                                  )}{" "}
+                                  KB
+                                </span>
+                              </div>
                               <span
-                                key={`${event.id}-${documentName}`}
-                                className="tag success-tag"
+                                className={`status-pill ${item.selectedDocumentName ? "ready" : "needs-info"}`}
                               >
-                                {documentName}
+                                {selectedLabel}
                               </span>
-                            ))}
+                            </div>
+
+                            <label className="bulk-preview-field">
+                              <span>المتطلب الذي سيذهب إليه الملف</span>
+                              <select
+                                value={item.selectedDocumentName}
+                                onChange={(event) =>
+                                  updateBulkUploadPreviewSelection(
+                                    item.id,
+                                    event.target.value,
+                                  )
+                                }
+                                disabled={isConfirmingBulkUpload || isAnalyzing}
+                              >
+                                <option value="">
+                                  اترك هذا الملف بدون رفع
+                                </option>
+                                {activeScopedPolicy.requiredDocuments.map(
+                                  (documentName) => {
+                                    const existingAttachment =
+                                      getAttachmentForRequiredDocument(
+                                        form.uploadedAttachments,
+                                        documentName,
+                                      );
+
+                                    return (
+                                      <option
+                                        key={`${item.id}-${documentName}`}
+                                        value={documentName}
+                                      >
+                                        {formatChecklistDocumentLabel(
+                                          documentName,
+                                        )}
+                                        {existingAttachment
+                                          ? ` - سيستبدل ${existingAttachment.name}`
+                                          : ""}
+                                      </option>
+                                    );
+                                  },
+                                )}
+                              </select>
+                            </label>
+
+                            <div className="bulk-preview-meta">
+                              {item.suggestedDocumentName ? (
+                                <span>
+                                  المطابقة التلقائية:{" "}
+                                  {formatChecklistDocumentLabel(
+                                    item.suggestedDocumentName,
+                                  )}
+                                </span>
+                              ) : item.topCandidateDocumentName ? (
+                                <span>
+                                  أقرب متطلب بالاسم:{" "}
+                                  {formatChecklistDocumentLabel(
+                                    item.topCandidateDocumentName,
+                                  )}
+                                </span>
+                              ) : (
+                                <span>
+                                  لا يوجد تطابق تلقائي واضح لاسم هذا الملف.
+                                </span>
+                              )}
+                              {isManualSelection ? (
+                                <span>تم تعديل هذا الربط يدوياً.</span>
+                              ) : null}
+                              {!item.selectedDocumentName &&
+                              item.topCandidateDocumentName ? (
+                                <span>
+                                  ملف آخر في نفس الدفعة حجز هذا المتطلب بدرجة
+                                  أعلى، ويمكنك إعادة التوزيع يدوياً إذا لزم
+                                  الأمر.
+                                </span>
+                              ) : null}
+                              {selectedAttachment ? (
+                                <span>
+                                  سيستبدل الملف الحالي في الخانة:{" "}
+                                  {selectedAttachment.name}
+                                </span>
+                              ) : null}
+                            </div>
+                          </article>
+                        );
+                      })}
+                    </div>
+
+                    <div className="bulk-preview-actions">
+                      <button
+                        type="button"
+                        className="ghost-button"
+                        onClick={clearBulkUploadPreview}
+                        disabled={isConfirmingBulkUpload || isAnalyzing}
+                      >
+                        إلغاء هذه الدفعة
+                      </button>
+                      <button
+                        type="button"
+                        className="primary-button bulk-preview-confirm"
+                        onClick={() => void confirmBulkUploadPreview()}
+                        disabled={isConfirmingBulkUpload || isAnalyzing}
+                      >
+                        {isConfirmingBulkUpload
+                          ? "جاري بدء الرفع"
+                          : "تأكيد المعاينة وبدء الرفع"}
+                      </button>
+                    </div>
+                  </div>
+                ) : null}
+                {isAnalyzing ? (
+                  <AnalysisTracePanel
+                    message="جاري فحص الملفات المرفوعة وتجهيز نتائجها..."
+                    events={analysisTrace}
+                    active={isAnalyzing}
+                  />
+                ) : null}
+                {analysisError ? (
+                  <div className="upload-status error">{analysisError}</div>
+                ) : null}
+                {!isAnalyzing && analysisTrace.length > 0 ? (
+                  <details
+                    key={`analysis-trace-${analysisTrace.length}`}
+                    className="analysis-trace-panel analysis-trace-panel-resting"
+                  >
+                    <summary>
+                      <span>آخر سجل معالجة</span>
+                      <strong>{analysisTrace.length}</strong>
+                    </summary>
+                    <div className="analysis-trace-meta">
+                      <span>
+                        يمكنك مراجعة ما تم على الملفات خطوة بخطوة مع ملخص
+                        المخرجات التشغيلية.
+                      </span>
+                    </div>
+                    <div className="analysis-trace-list">
+                      {analysisTrace.map((event) => (
+                        <article
+                          key={event.id}
+                          className={`analysis-trace-item ${event.status}`}
+                        >
+                          <div className="analysis-trace-header">
+                            <strong>{event.title}</strong>
+                            <span>{event.fileName ?? event.phase}</span>
                           </div>
-                        ) : null}
-                        {event.model || event.responseSummary ? (
-                          <div className="analysis-trace-extra">
-                            {event.model ? (
-                              <small>النموذج: {event.model}</small>
+                          <p>{event.detail}</p>
+                          {event.detectedDocuments &&
+                          event.detectedDocuments.length > 0 ? (
+                            <div className="analysis-trace-tags">
+                              {event.detectedDocuments.map((documentName) => (
+                                <span
+                                  key={`${event.id}-${documentName}`}
+                                  className="tag success-tag"
+                                >
+                                  {formatChecklistDocumentLabel(documentName)}
+                                </span>
+                              ))}
+                            </div>
+                          ) : null}
+                          {event.model || event.responseSummary ? (
+                            <div className="analysis-trace-extra">
+                              {event.model ? (
+                                <small>النموذج: {event.model}</small>
+                              ) : null}
+                              {event.responseSummary ? (
+                                <small>
+                                  ملخص الاستجابة: {event.responseSummary}
+                                </small>
+                              ) : null}
+                            </div>
+                          ) : null}
+                        </article>
+                      ))}
+                    </div>
+                  </details>
+                ) : null}
+                <div className="attachment-stack">
+                  {activeScopedPolicy.requiredDocuments.map((documentName) => {
+                    const attachment = getAttachmentForRequiredDocument(
+                      form.uploadedAttachments,
+                      documentName,
+                    );
+                    const isDocumentUploading =
+                      uploadingDocuments.includes(documentName);
+                    const slotAnalysis = buildDocumentUploadSlotAnalysis(
+                      documentName,
+                      attachment,
+                      draftDisplayValidations,
+                    );
+
+                    return (
+                      <article
+                        key={documentName}
+                        className={`attachment-card ${attachment ? "filled-slot" : "empty-slot"}`}
+                      >
+                        <div className="attachment-header">
+                          <div className="attachment-header-copy">
+                            <strong>
+                              {formatChecklistDocumentLabel(documentName)}
+                            </strong>
+                            {attachment ? (
+                              <span>
+                                {`${attachment.name} - ${Math.round(attachment.size / 1024)} KB`}
+                              </span>
                             ) : null}
-                            {event.responseSummary ? (
-                              <small>
-                                ملخص الاستجابة: {event.responseSummary}
+                            {attachment?.aiValidation?.model ? (
+                              <small className="attachment-ai-model">
+                                <AiAnalysisIcon className="ai-analysis-icon-xs" />
+                                <span>
+                                  المحرك: {attachment.aiValidation.model}
+                                </span>
                               </small>
                             ) : null}
                           </div>
+                          <div className="attachment-card-actions">
+                            <label
+                              className={`upload-dropzone ${attachment ? "is-filled" : "is-empty"}${!canUploadFiles || isDocumentUploading ? " is-disabled" : ""}`}
+                              aria-disabled={
+                                !canUploadFiles || isDocumentUploading
+                              }
+                              title={
+                                isDocumentUploading
+                                  ? "جاري فحص الملف"
+                                  : attachment
+                                    ? "استبدال الملف"
+                                    : `رفع ملف لـ ${formatChecklistDocumentLabel(documentName)}`
+                              }
+                            >
+                              <input
+                                type="file"
+                                accept=".pdf,.docx,.txt,.json,.md,.png,.jpg,.jpeg,.webp"
+                                disabled={
+                                  !canUploadFiles || isDocumentUploading
+                                }
+                                onChange={(event) => {
+                                  void handleFileSelection(
+                                    documentName,
+                                    event.target.files,
+                                  );
+                                  event.target.value = "";
+                                }}
+                              />
+                              <span className="upload-dropzone-icon-shell">
+                                {isDocumentUploading ? (
+                                  <AiAnalysisIcon className="upload-dropzone-ai-icon ai-analysis-icon-pulse" />
+                                ) : (
+                                  <span
+                                    className="upload-dropzone-icon"
+                                    aria-hidden="true"
+                                  >
+                                    +
+                                  </span>
+                                )}
+                                <span className="sr-only">
+                                  {isDocumentUploading
+                                    ? "جاري فحص الملف"
+                                    : attachment
+                                      ? "استبدال الملف"
+                                      : `رفع ملف لـ ${formatChecklistDocumentLabel(documentName)}`}
+                                </span>
+                              </span>
+                            </label>
+                            {attachment ? (
+                              <>
+                                <AttachmentPreviewAction
+                                  attachment={attachment}
+                                  onPreview={openAttachmentPreview}
+                                />
+                                <button
+                                  className="ghost-button"
+                                  onClick={() => removeAttachment(documentName)}
+                                  disabled={isDocumentUploading}
+                                >
+                                  إزالة
+                                </button>
+                              </>
+                            ) : null}
+                          </div>
+                        </div>
+
+                        {isDocumentUploading ? (
+                          <div
+                            className="upload-status loading-banner slot-loading-banner"
+                            role="status"
+                            aria-live="polite"
+                          >
+                            <AiAnalysisIcon className="ai-analysis-icon-sm ai-analysis-icon-pulse" />
+                            <span>
+                              جاري فحص الملف المرفوع لهذا المتطلب وإعداد نتيجة
+                              التحقق.
+                            </span>
+                          </div>
+                        ) : attachment ? (
+                          <div
+                            className={`upload-status ${slotAnalysis.status === "passed" ? "success" : slotAnalysis.status === "empty" ? "empty" : "error"}`.trim()}
+                          >
+                            <div className="slot-analysis-row">
+                              <span>{slotAnalysis.summary}</span>
+                              {slotAnalysis.confidence ? (
+                                <span className="slot-confidence-badge">
+                                  الثقة {slotAnalysis.confidence}%
+                                </span>
+                              ) : null}
+                            </div>
+                          </div>
+                        ) : null}
+
+                        {!isDocumentUploading &&
+                        attachment &&
+                        slotAnalysis.note ? (
+                          <small>{slotAnalysis.note}</small>
+                        ) : null}
+
+                        {attachment ? (
+                          <>
+                            {attachment.aiValidation?.feedback &&
+                            attachment.aiValidation.feedback.length > 0 ? (
+                              <ul className="inline-list">
+                                {attachment.aiValidation.feedback.map(
+                                  (feedbackItem) => (
+                                    <li key={feedbackItem}>{feedbackItem}</li>
+                                  ),
+                                )}
+                              </ul>
+                            ) : null}
+                            {attachment.aiValidation?.checklistResults &&
+                            attachment.aiValidation.checklistResults.length >
+                              0 ? (
+                              <div className="validation-evidence-block attachment-checklist-block">
+                                <strong>نتائج فحص عناصر المخطط المعماري</strong>
+                                <ul>
+                                  {attachment.aiValidation.checklistResults.map(
+                                    (result) => (
+                                      <li
+                                        key={`${attachment.id}-${result.item}`}
+                                      >
+                                        <strong>{result.item}</strong>
+                                        {`: ${
+                                          result.status === "Compliant"
+                                            ? "متوافق"
+                                            : result.status === "Non-Compliant"
+                                              ? "غير متوافق"
+                                              : "غير موجود"
+                                        } - ${result.comment}`}
+                                      </li>
+                                    ),
+                                  )}
+                                </ul>
+                              </div>
+                            ) : null}
+                            <div className="attachment-tags">
+                              {attachment.detectedDocuments.map((document) => (
+                                <span
+                                  key={document}
+                                  className="tag success-tag"
+                                >
+                                  {formatChecklistDocumentLabel(document)}
+                                </span>
+                              ))}
+                              {attachment.detectedDocuments.length === 0 ? (
+                                <span className="tag">غير مرتبط تلقائياً</span>
+                              ) : null}
+                            </div>
+                          </>
                         ) : null}
                       </article>
-                    ))}
-                  </div>
-                </details>
-              ) : null}
-              <div className="document-grid">
-                {activePolicy.requiredDocuments.map((document) => {
-                  const checked = form.selectedDocuments.includes(document);
-                  return (
-                    <div
-                      key={document}
-                      className={`document-chip ${checked ? "checked" : ""}`}
-                    >
-                      <span>{document}</span>
-                    </div>
-                  );
-                })}
-              </div>
-              <div className="attachment-stack">
-                {form.uploadedAttachments.map((attachment) => (
-                  <article key={attachment.id} className="attachment-card">
-                    <div className="attachment-header">
-                      <div>
-                        <strong>{attachment.name}</strong>
-                        <span>
-                          {attachment.sourceType} -{" "}
-                          {Math.round(attachment.size / 1024)} KB
-                        </span>
-                      </div>
-                      <button
-                        className="ghost-button"
-                        onClick={() => removeAttachment(attachment.id)}
-                      >
-                        إزالة
-                      </button>
-                    </div>
-                    <p>
-                      {attachment.excerpt || "لم يتم استخراج نص قابل للعرض."}
-                    </p>
-                    <div className="attachment-tags">
-                      {attachment.detectedDocuments.map((document) => (
-                        <span key={document} className="tag success-tag">
-                          {document}
-                        </span>
-                      ))}
-                      {attachment.detectedDocuments.length === 0 ? (
-                        <span className="tag">غير مرتبط تلقائياً</span>
-                      ) : null}
-                    </div>
-                    {attachment.notes.length > 0 ? (
-                      <ul className="inline-list">
-                        {attachment.notes.map((note) => (
-                          <li key={note}>{note}</li>
-                        ))}
-                      </ul>
-                    ) : null}
-                  </article>
-                ))}
-                {form.uploadedAttachments.length === 0 ? (
-                  <div className="empty-attachments">لم يتم رفع ملفات بعد.</div>
-                ) : null}
-              </div>
+                    );
+                  })}
+                </div>
+              </SmartDisclosure>
             </div>
 
             {submitError ? (
@@ -1541,7 +3031,7 @@ export default function App() {
               onClick={submitApplication}
               disabled={!canSubmit}
             >
-              إرسال الطلب إلى طبقة الأمانة
+              إرسال الطلب إلى واجهة الأمانة
             </button>
           </section>
 
@@ -1549,7 +3039,7 @@ export default function App() {
             <div className="panel-header">
               <div className="section-title-row">
                 <h2>حالة التجهيز</h2>
-                <HelpHint text="هذه اللوحة تركّز على الجاهزية الحالية. التفاصيل الطويلة مثل الأدلة والمراجع والتعليلات أصبحت داخل أقسام قابلة للتوسيع." />
+                <HelpHint text="هذه اللوحة تركّز على جاهزية الطلب الحالية، بينما تبقى التفاصيل المرجعية والتحققية ضمن أقسام قابلة للتوسيع." />
               </div>
               <p>عرض سريع للجاهزية قبل الإرسال إلى الأمانة.</p>
             </div>
@@ -1568,19 +3058,19 @@ export default function App() {
                       tone: "success",
                     },
                     {
-                      label: "الناقص",
+                      label: "المتحقق منه",
+                      value: draftValidatedDocuments.length,
+                      tone:
+                        draftValidatedDocuments.length > 0
+                          ? "success"
+                          : "default",
+                    },
+                    {
+                      label: "غير الموجود",
                       value: draftReview.missingDocuments.length,
                       tone:
                         draftReview.missingDocuments.length > 0
                           ? "warning"
-                          : "default",
-                    },
-                    {
-                      label: "التنبيهات",
-                      value: draftReview.policyAlerts.length,
-                      tone:
-                        draftReview.policyAlerts.length > 0
-                          ? "danger"
                           : "default",
                     },
                   ]}
@@ -1624,18 +3114,47 @@ export default function App() {
             </div>
 
             {hasUploadedFiles ? (
-              <div className="review-card">
-                <h3>نتيجة القراءة الفعلية للملفات</h3>
-                <ul>
-                  {form.uploadedAttachments.map((attachment) => (
-                    <li key={attachment.id}>
-                      {attachment.name}:{" "}
-                      {attachment.detectedDocuments.length > 0
-                        ? attachment.detectedDocuments.join("، ")
-                        : "لم يتم التعرف على مستند مطلوب"}
-                    </li>
-                  ))}
-                </ul>
+              <div className="review-card compact-card">
+                <SmartDisclosure
+                  title="مراجعة واضحة حسب كل ملف"
+                  count={form.uploadedAttachments.length}
+                  defaultOpen
+                >
+                  <p>
+                    كل ملف أدناه يحمل ربطه الخاص بالمستندات والتنبيهات، بدلاً من
+                    تجميع الملاحظات في قائمة عامة واحدة.
+                  </p>
+                  <ReviewGlance
+                    items={[
+                      {
+                        label: "ملفات واضحة",
+                        value: draftAttachmentReviews.filter(
+                          (item) => item.status === "passed",
+                        ).length,
+                        tone: "success",
+                      },
+                      {
+                        label: "ملفات تحتاج انتباهاً",
+                        value: draftAttachmentReviews.filter(
+                          (item) => item.status === "warning",
+                        ).length,
+                        tone: "warning",
+                      },
+                      {
+                        label: "ملفات غير مرتبطة",
+                        value: draftAttachmentReviews.filter(
+                          (item) => item.status === "missing",
+                        ).length,
+                        tone: "danger",
+                      },
+                    ]}
+                  />
+                  <AttachmentReviewCards
+                    attachments={form.uploadedAttachments}
+                    validations={draftDisplayValidations}
+                    onPreviewAttachment={openAttachmentPreview}
+                  />
+                </SmartDisclosure>
               </div>
             ) : null}
 
@@ -1653,23 +3172,27 @@ export default function App() {
             </div>
 
             {hasUploadedFiles ? (
-              <div className="review-card tone-warning">
-                <h3>تنبيهات الذكاء الاصطناعي</h3>
-                <ul>
-                  {draftReview.policyAlerts.map((alert) => (
-                    <li key={alert}>{alert}</li>
-                  ))}
-                  {draftReview.policyAlerts.length === 0 ? (
-                    <li>لا توجد تنبيهات حرجة في هذه المرحلة.</li>
-                  ) : null}
-                </ul>
+              <div className="review-card compact-card">
+                <SmartDisclosure
+                  title="ملاحظات إضافية"
+                  count={draftReview.policyAlerts.length}
+                >
+                  <ul>
+                    {draftReview.policyAlerts.map((alert) => (
+                      <li key={alert}>{alert}</li>
+                    ))}
+                    {draftReview.policyAlerts.length === 0 ? (
+                      <li>لا توجد تنبيهات حرجة في هذه المرحلة.</li>
+                    ) : null}
+                  </ul>
+                </SmartDisclosure>
               </div>
             ) : null}
 
             {hasUploadedFiles && draftDisplayValidations.length > 0 ? (
               <div className="review-card compact-card">
                 <SmartDisclosure
-                  title="تحقق تفصيلي من المخططات"
+                  title="تفاصيل التحقق"
                   count={draftDisplayValidations.length}
                 >
                   <ValidationCards validations={draftDisplayValidations} />
@@ -1682,7 +3205,9 @@ export default function App() {
                 <h3>المرفقات الناقصة</h3>
                 <ul>
                   {draftReview.missingDocuments.slice(0, 8).map((document) => (
-                    <li key={document}>{document}</li>
+                    <li key={document}>
+                      {formatChecklistDocumentLabel(document)}
+                    </li>
                   ))}
                   {draftReview.missingDocuments.length === 0 ? (
                     <li>جميع المرفقات الأساسية موجودة.</li>
@@ -1707,17 +3232,6 @@ export default function App() {
                 </ol>
               </SmartDisclosure>
             </div>
-
-            <EvidenceList
-              title="شواهد المستندات من الملف الأصلي"
-              citations={draftReview.documentEvidence.slice(0, 6)}
-              onPreviewSource={openSourcePreview}
-            />
-            <EvidenceList
-              title="شواهد الإجراءات من الملف الأصلي"
-              citations={draftReview.workflowEvidence.slice(0, 4)}
-              onPreviewSource={openSourcePreview}
-            />
           </aside>
         </main>
       ) : (
@@ -1745,6 +3259,16 @@ export default function App() {
                     <div>
                       <strong>{application.id}</strong>
                       <span>{policy.title}</span>
+                      {application.projectTypeGroupId ||
+                      application.projectSubtypeId ? (
+                        <small>
+                          {buildProjectTypeSummary(
+                            policy,
+                            application.projectTypeGroupId ?? "",
+                            application.projectSubtypeId ?? "",
+                          )}
+                        </small>
+                      ) : null}
                     </div>
                     <div>
                       <em>{application.officeName}</em>
@@ -1759,9 +3283,9 @@ export default function App() {
               })}
               {applications.length === 0 ? (
                 <div className="empty-attachments">
-                  لا توجد معاملات في طبقة الأمانة بعد. أرسل طلباً من طبقة المكتب
-                  الهندسي ليظهر هنا بنفس البيانات الفعلية والمرفقات التي تم
-                  تحليلها.
+                  لا توجد معاملات في واجهة الأمانة بعد. أرسل طلباً من واجهة
+                  المكتب الهندسي ليظهر هنا بنفس البيانات الفعلية والمرفقات التي
+                  تم فحصها.
                 </div>
               ) : null}
             </div>
@@ -1808,6 +3332,18 @@ export default function App() {
                     </strong>
                   </div>
                   <div className="detail-card">
+                    <span>نوع المشروع</span>
+                    <strong>
+                      {buildProjectTypeSummary(
+                        policies.find(
+                          (item) => item.id === selectedApplication.policyId,
+                        ) ?? policies[0],
+                        selectedApplication.projectTypeGroupId ?? "",
+                        selectedApplication.projectSubtypeId ?? "",
+                      )}
+                    </strong>
+                  </div>
+                  <div className="detail-card">
                     <span>وقت التقديم</span>
                     <strong>{selectedApplication.submittedAt}</strong>
                   </div>
@@ -1821,27 +3357,27 @@ export default function App() {
                       tone: "success",
                     },
                     {
-                      label: "الناقص",
+                      label: "المتحقق منه",
+                      value: selectedValidatedDocuments.length,
+                      tone:
+                        selectedValidatedDocuments.length > 0
+                          ? "success"
+                          : "default",
+                    },
+                    {
+                      label: "غير الموجود",
                       value: selectedApplication.review.missingDocuments.length,
                       tone:
                         selectedApplication.review.missingDocuments.length > 0
                           ? "warning"
                           : "default",
                     },
-                    {
-                      label: "التنبيهات",
-                      value: selectedApplication.review.policyAlerts.length,
-                      tone:
-                        selectedApplication.review.policyAlerts.length > 0
-                          ? "danger"
-                          : "default",
-                    },
                   ]}
                 />
 
                 <div className="review-columns">
-                  <div className="review-card tone-neutral">
-                    <h3>ملخص الذكاء الاصطناعي</h3>
+                  <div className="review-card tone-neutral review-card-full-span">
+                    <h3>ملخص المراجعة المساندة</h3>
                     <p>{selectedApplication.review.summary}</p>
                     <small>{selectedApplication.review.nextStep}</small>
                     <LlmSupportContent
@@ -1866,7 +3402,9 @@ export default function App() {
                     <h3>المرفقات المستلمة</h3>
                     <ul>
                       {selectedApplication.selectedDocuments.map((document) => (
-                        <li key={document}>{document}</li>
+                        <li key={document}>
+                          {formatChecklistDocumentLabel(document)}
+                        </li>
                       ))}
                       {selectedApplication.selectedDocuments.length === 0 ? (
                         <li>
@@ -1881,7 +3419,9 @@ export default function App() {
                     <ul>
                       {selectedApplication.review.missingDocuments.map(
                         (document) => (
-                          <li key={document}>{document}</li>
+                          <li key={document}>
+                            {formatChecklistDocumentLabel(document)}
+                          </li>
                         ),
                       )}
                       {selectedApplication.review.missingDocuments.length ===
@@ -1891,16 +3431,23 @@ export default function App() {
                     </ul>
                   </div>
 
-                  <div className="review-card tone-warning">
-                    <h3>التنبيهات النظامية</h3>
-                    <ul>
-                      {selectedApplication.review.policyAlerts.map((alert) => (
-                        <li key={alert}>{alert}</li>
-                      ))}
-                      {selectedApplication.review.policyAlerts.length === 0 ? (
-                        <li>الفحص الآلي لم يرصد تنبيهات إضافية.</li>
-                      ) : null}
-                    </ul>
+                  <div className="review-card compact-card">
+                    <SmartDisclosure
+                      title="ملاحظات إضافية"
+                      count={selectedApplication.review.policyAlerts.length}
+                    >
+                      <ul>
+                        {selectedApplication.review.policyAlerts.map(
+                          (alert) => (
+                            <li key={alert}>{alert}</li>
+                          ),
+                        )}
+                        {selectedApplication.review.policyAlerts.length ===
+                        0 ? (
+                          <li>الفحص الآلي لم يرصد تنبيهات إضافية.</li>
+                        ) : null}
+                      </ul>
+                    </SmartDisclosure>
                   </div>
                 </div>
 
@@ -1924,7 +3471,7 @@ export default function App() {
                 {selectedDisplayValidations.length > 0 ? (
                   <div className="review-card compact-card">
                     <SmartDisclosure
-                      title="تحقق تفصيلي من المخططات"
+                      title="تفاصيل التحقق"
                       count={selectedDisplayValidations.length}
                     >
                       <ValidationCards
@@ -1950,32 +3497,40 @@ export default function App() {
 
                 <div className="review-card compact-card">
                   <SmartDisclosure
-                    title="الملفات الفعلية التي تم تحليلها"
+                    title="الملفات الفعلية التي تم فحصها"
                     count={selectedApplication.uploadedAttachments.length}
+                    defaultOpen
                   >
-                    <div className="attachment-stack compact">
-                      {selectedApplication.uploadedAttachments.map(
-                        (attachment) => (
-                          <article
-                            key={attachment.id}
-                            className="attachment-card compact"
-                          >
-                            <div className="attachment-header">
-                              <div>
-                                <strong>{attachment.name}</strong>
-                                <span>{attachment.sourceType}</span>
-                              </div>
-                            </div>
-                            <p>{attachment.excerpt || "لا يوجد نص مستخرج."}</p>
-                          </article>
-                        ),
-                      )}
-                      {selectedApplication.uploadedAttachments.length === 0 ? (
-                        <div className="empty-attachments">
-                          لا توجد ملفات فعلية مرفقة مع هذه المعاملة.
-                        </div>
-                      ) : null}
-                    </div>
+                    <ReviewGlance
+                      items={[
+                        {
+                          label: "ملفات واضحة",
+                          value: selectedAttachmentReviews.filter(
+                            (item) => item.status === "passed",
+                          ).length,
+                          tone: "success",
+                        },
+                        {
+                          label: "ملفات تحتاج انتباهاً",
+                          value: selectedAttachmentReviews.filter(
+                            (item) => item.status === "warning",
+                          ).length,
+                          tone: "warning",
+                        },
+                        {
+                          label: "ملفات غير مرتبطة",
+                          value: selectedAttachmentReviews.filter(
+                            (item) => item.status === "missing",
+                          ).length,
+                          tone: "danger",
+                        },
+                      ]}
+                    />
+                    <AttachmentReviewCards
+                      attachments={selectedApplication.uploadedAttachments}
+                      validations={selectedDisplayValidations}
+                      onPreviewAttachment={openAttachmentPreview}
+                    />
                   </SmartDisclosure>
                 </div>
 
@@ -2036,23 +3591,6 @@ export default function App() {
                   </SmartDisclosure>
                 </div>
 
-                <EvidenceList
-                  title="أدلة المستندات من المصدر"
-                  citations={selectedApplication.review.documentEvidence.slice(
-                    0,
-                    8,
-                  )}
-                  onPreviewSource={openSourcePreview}
-                />
-                <EvidenceList
-                  title="أدلة الخطوات الإجرائية من المصدر"
-                  citations={selectedApplication.review.workflowEvidence.slice(
-                    0,
-                    6,
-                  )}
-                  onPreviewSource={openSourcePreview}
-                />
-
                 <div className="action-row">
                   <button className="secondary-button">
                     طلب استكمال من المكتب
@@ -2063,8 +3601,8 @@ export default function App() {
               </>
             ) : (
               <div className="empty-attachments">
-                لا توجد معاملة محددة للمراجعة. بعد إرسال أول طلب من طبقة المكتب
-                سيظهر هنا ملف البلدية الحقيقي المرتبط به.
+                لا توجد معاملة محددة للمراجعة. بعد إرسال أول طلب من واجهة المكتب
+                الهندسي سيظهر هنا ملف الأمانة المرتبط به.
               </div>
             )}
           </section>
@@ -2073,17 +3611,27 @@ export default function App() {
 
       <footer className="site-footer">
         <div className="site-footer-brand">
-          <img
-            className="footer-logo"
-            src="https://www.alriyadh.gov.sa/images/logo.png"
-            alt="شعار أمانة منطقة الرياض"
-          />
-          <div>
-            <strong>أمانة منطقة الرياض</strong>
-            <p>
-              منظومة داخلية تدعم فرق الاستقبال والتدقيق في فرز الطلبات، التحقق
-              من اكتمال المستندات، وتسريع اتخاذ الإجراء المناسب.
-            </p>
+          <div className="site-footer-brand-main">
+            <img
+              className="footer-logo"
+              src="https://www.alriyadh.gov.sa/images/logo.png"
+              alt="شعار أمانة منطقة الرياض"
+            />
+            <div>
+              <strong>أمانة منطقة الرياض</strong>
+              <p>
+                منظومة داخلية تدعم فرق الاستقبال والتدقيق في فرز الطلبات، التحقق
+                من اكتمال المستندات، وتسريع اتخاذ الإجراء المناسب.
+              </p>
+            </div>
+          </div>
+
+          <div className="site-footer-partners">
+            <img
+              className="footer-vision-logo"
+              src="https://www.alriyadh.gov.sa/_next/static/media/vision30.1c33917f.svg"
+              alt="شعار رؤية السعودية 2030"
+            />
           </div>
         </div>
 
@@ -2095,7 +3643,7 @@ export default function App() {
             </span>
           </div>
           <div className="site-footer-stat">
-            <strong>تحليل ذكي</strong>
+            <strong>مراجعة مساندة</strong>
             <span>
               استخراج قرائن من الملفات والسياسات لمساندة المراجع دون استبدال
               القرار البشري
@@ -2112,7 +3660,7 @@ export default function App() {
 
         <div className="site-footer-bottom">
           <span>جميع الحقوق محفوظة لأمانة منطقة الرياض © 2026</span>
-          <span>نسخة عمل داخلية للاستخدام التشغيلي والتطوير</span>
+          <span>نسخة تشغيل داخلية للاستخدام المؤسسي والتطوير المستمر</span>
         </div>
       </footer>
 
@@ -2132,7 +3680,7 @@ export default function App() {
             <div className="preview-modal-header">
               <div>
                 <strong>{previewSourceName}</strong>
-                <small>معاينة مباشرة لملف المصدر</small>
+                <small>{previewSourceLabel}</small>
               </div>
               <button
                 type="button"
@@ -2170,6 +3718,18 @@ export default function App() {
                 className="preview-frame"
                 srcDoc={previewState.html}
               />
+            ) : null}
+
+            {!previewLoading &&
+            previewState.kind === "image" &&
+            previewState.url ? (
+              <div className="preview-image-shell">
+                <img
+                  src={previewState.url}
+                  alt={previewSourceName}
+                  className="preview-image"
+                />
+              </div>
             ) : null}
 
             {!previewLoading && previewState.kind === "unsupported" ? (

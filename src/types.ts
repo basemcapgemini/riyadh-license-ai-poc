@@ -6,6 +6,20 @@ export type WorkflowStep = {
   phase: "office" | "municipality";
 };
 
+export type ProjectSubtype = {
+  id: string;
+  title: string;
+  sourceCode?: string;
+  requiredDocuments?: string[];
+};
+
+export type ProjectTypeGroup = {
+  id: string;
+  title: string;
+  sourceCode?: string;
+  subtypes: ProjectSubtype[];
+};
+
 export type LicensePolicy = {
   id: string;
   title: string;
@@ -14,6 +28,7 @@ export type LicensePolicy = {
   requiredDocuments: string[];
   workflow: WorkflowStep[];
   platform: string;
+  projectTypes?: ProjectTypeGroup[];
 };
 
 export type SubmissionForm = {
@@ -24,6 +39,8 @@ export type SubmissionForm = {
   mobile: string;
   district: string;
   plotNumber: string;
+  projectTypeGroupId: string;
+  projectSubtypeId: string;
   projectDescription: string;
   selectedDocuments: string[];
   comments: string;
@@ -52,6 +69,7 @@ export type AttachmentAnalysisTraceEvent = {
 
 export type UploadedAttachment = {
   id: string;
+  requiredDocument?: string;
   name: string;
   mimeType: string;
   size: number;
@@ -60,6 +78,39 @@ export type UploadedAttachment = {
   excerpt: string;
   detectedDocuments: string[];
   notes: string[];
+  preview?: AttachmentPreview;
+  aiValidation?: AttachmentAiValidation;
+};
+
+export type AttachmentPreview = {
+  fileName: string;
+  kind: "pdf" | "html" | "image" | "unsupported";
+  url?: string;
+  html?: string;
+  message?: string;
+  revokeObjectUrl?: boolean;
+};
+
+export type AttachmentAiValidationStatus = "passed" | "warning" | "missing";
+
+export type AttachmentChecklistReviewStatus =
+  | "Compliant"
+  | "Non-Compliant"
+  | "Not Found";
+
+export type AttachmentChecklistResult = {
+  item: string;
+  status: AttachmentChecklistReviewStatus;
+  comment: string;
+};
+
+export type AttachmentAiValidation = {
+  status: AttachmentAiValidationStatus;
+  summary: string;
+  feedback: string[];
+  confidence: number;
+  model?: string;
+  checklistResults?: AttachmentChecklistResult[];
 };
 
 export type EvidenceCitation = {
@@ -101,6 +152,78 @@ export type SuggestedResponse = {
   source?: "rule" | "ai";
 };
 
+export type ComplianceConfidenceLevel = "High" | "Medium" | "Low";
+
+export type ComplianceAttachmentStatus =
+  | "Present"
+  | "Missing"
+  | "Invalid / Unclear";
+
+export type ComplianceDataConsistencyStatus = "Match" | "Mismatch" | "Missing";
+
+export type ComplianceAttachmentAccuracyStatus =
+  | "Valid"
+  | "Invalid"
+  | "Partially Valid";
+
+export type ComplianceRequirementsStatus = "Compliant" | "Not Compliant";
+
+export type ComplianceChecklistStatus =
+  | "Compliant"
+  | "Non-Compliant"
+  | "Not Found";
+
+export type ComplianceOverallStatus = "Complete" | "Incomplete";
+
+export type ComplianceAttachmentRow = {
+  attachment: string;
+  status: ComplianceAttachmentStatus;
+  notes: string;
+  sourceRefs?: string[];
+};
+
+export type ComplianceDataConsistencyRow = {
+  field: string;
+  sak: string;
+  otherDocs: string;
+  status: ComplianceDataConsistencyStatus;
+  sourceRefs?: string[];
+};
+
+export type ComplianceChecklistRow = {
+  item: string;
+  status: ComplianceChecklistStatus;
+  comment: string;
+  sourceRefs?: string[];
+};
+
+export type ComplianceReport = {
+  projectInformation: {
+    projectType: string;
+    confidenceLevel: ComplianceConfidenceLevel;
+  };
+  attachmentsStatus: {
+    overallStatus: ComplianceOverallStatus;
+    rows: ComplianceAttachmentRow[];
+  };
+  dataConsistencyCheck: ComplianceDataConsistencyRow[];
+  attachmentAccuracy: {
+    status: ComplianceAttachmentAccuracyStatus;
+    notes: string[];
+  };
+  architecturalCompliance: {
+    requirementsCompliance: ComplianceRequirementsStatus;
+    notesForCheck: ComplianceChecklistRow[];
+    violations: string[];
+  };
+  finalSummary: {
+    attachments: string;
+    dataConsistency: string;
+    architecturalCompliance: string;
+    keyIssues: string[];
+  };
+};
+
 export type LlmReview = {
   model: string;
   generatedAt: string;
@@ -113,6 +236,7 @@ export type LlmReview = {
   suggestedActions: string[];
   documentValidations: DocumentValidation[];
   suggestedResponses: SuggestedResponse[];
+  complianceReport?: ComplianceReport;
   evidence: Array<{
     label: string;
     sourcePath: string;
@@ -146,6 +270,8 @@ export type ApplicationRecord = {
   officeName: string;
   district: string;
   plotNumber: string;
+  projectTypeGroupId?: string;
+  projectSubtypeId?: string;
   projectDescription: string;
   selectedDocuments: string[];
   comments: string;

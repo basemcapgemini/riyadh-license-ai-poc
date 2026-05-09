@@ -6,9 +6,13 @@ import {
   type PDFPageProxy,
 } from "pdfjs-dist";
 import { recognize } from "tesseract.js";
+import { requestCadPageClassification } from "../api/cadPageClassification";
 import { requestAttachmentExtraction } from "../api/attachmentExtraction";
+import { requestAttachmentValidation } from "../api/attachmentValidation";
 import type {
+  AttachmentAiValidation,
   AttachmentAnalysisTraceEvent,
+  AttachmentPreview,
   LicensePolicy,
   UploadedAttachment,
 } from "../types";
@@ -22,8 +26,16 @@ GlobalWorkerOptions.workerSrc = new URL(
 const MAX_ATTACHMENT_TEXT_LENGTH = 24000;
 const MAX_AI_ATTACHMENT_TEXT_LENGTH = 6000;
 const AI_PDF_BATCH_SIZE = 6;
+const MAX_PARALLEL_ATTACHMENT_ANALYSIS = 1;
+const MAX_PDF_OCR_FALLBACK_PAGES = 6;
+const CAD_SAMPLE_LOCAL_TEXT_PAGES = 10;
+const CAD_CLASSIFICATION_BATCH_SIZE = 12;
+const CAD_MAX_EXTRACTION_PAGES = 18;
+const CAD_MIN_RELEVANT_EXTRACTION_PAGES = 8;
 const DEFAULT_CPU_COUNT = 6;
 const PDF_OCR_FALLBACK_CONCURRENCY = 2;
+const CAD_MIN_PAGES = 40;
+const CAD_MIN_FILE_SIZE_BYTES = 15 * 1024 * 1024;
 
 function getAvailableCpuCount(): number {
   if (
@@ -39,8 +51,8 @@ function getAvailableCpuCount(): number {
 
 const AVAILABLE_CPU_COUNT = getAvailableCpuCount();
 const AI_PDF_BATCH_CONCURRENCY = Math.min(
-  5,
-  Math.max(3, Math.floor(AVAILABLE_CPU_COUNT / 2)),
+  2,
+  Math.max(1, Math.floor(AVAILABLE_CPU_COUNT / 4)),
 );
 const AI_PDF_RENDER_CONCURRENCY = Math.min(
   6,
@@ -65,6 +77,105 @@ function buildAttachmentId(file: File): string {
 
 function summarizeText(text: string): string {
   return text.slice(0, 260).trim();
+}
+
+function escapePreviewHtml(value: string): string {
+  return String(value || "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/\"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function wrapPreviewHtml(title: string, bodyHtml: string): string {
+  return `<!doctype html>
+<html lang="ar" dir="rtl">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>${escapePreviewHtml(title)}</title>
+    <style>
+      body { margin: 0; padding: 24px; font-family: "Noto Sans Arabic", "Segoe UI", sans-serif; background: #f6faf8; color: #14251f; line-height: 1.8; }
+      .preview-shell { max-width: 980px; margin: 0 auto; background: #fff; border: 1px solid rgba(0, 105, 70, 0.1); border-radius: 18px; padding: 24px; box-shadow: 0 12px 30px rgba(20, 37, 31, 0.08); }
+      h1 { margin: 0 0 16px; font-size: 1.2rem; }
+      pre { white-space: pre-wrap; word-break: break-word; margin: 0; }
+      img { max-width: 100%; height: auto; display: block; margin: 0 auto; }
+      table { width: 100%; border-collapse: collapse; }
+    </style>
+  </head>
+  <body>
+    <div class="preview-shell">
+      <h1>${escapePreviewHtml(title)}</h1>
+      ${bodyHtml}
+    </div>
+  </body>
+</html>`;
+}
+
+async function buildAttachmentPreview(
+  file: File,
+  sourceType: UploadedAttachment["sourceType"],
+  extractedText: string,
+): Promise<AttachmentPreview> {
+  if (sourceType === "pdf") {
+    return {
+      fileName: file.name,
+      kind: "pdf",
+      url: URL.createObjectURL(file),
+      revokeObjectUrl: true,
+    };
+  }
+
+  if (sourceType === "image") {
+    return {
+      fileName: file.name,
+      kind: "image",
+      url: URL.createObjectURL(file),
+      revokeObjectUrl: true,
+    };
+  }
+
+  if (sourceType === "docx") {
+    try {
+      const buffer = await file.arrayBuffer();
+      const result = await mammoth.extractRawText({ arrayBuffer: buffer });
+      return {
+        fileName: file.name,
+        kind: "html",
+        html: wrapPreviewHtml(
+          file.name,
+          `<pre>${escapePreviewHtml(result.value || extractedText)}</pre>`,
+        ),
+      };
+    } catch {
+      return {
+        fileName: file.name,
+        kind: "html",
+        html: wrapPreviewHtml(
+          file.name,
+          `<pre>${escapePreviewHtml(extractedText)}</pre>`,
+        ),
+      };
+    }
+  }
+
+  if (sourceType === "text" || sourceType === "unknown") {
+    return {
+      fileName: file.name,
+      kind: "html",
+      html: wrapPreviewHtml(
+        file.name,
+        `<pre>${escapePreviewHtml(extractedText || "لا يوجد محتوى نصي متاح للمعاينة.")}</pre>`,
+      ),
+    };
+  }
+
+  return {
+    fileName: file.name,
+    kind: "unsupported",
+    message: "المعاينة غير متاحة لهذا الملف.",
+  };
 }
 
 function normalizeExtractedText(text: string): string {
@@ -143,7 +254,8 @@ async function runPdfOcrFallback(
   const weakPageNumbers = pages
     .map((pageText, index) => ({ pageNumber: index + 1, pageText }))
     .filter(({ pageText }) => !hasMeaningfulPdfText(pageText))
-    .map(({ pageNumber }) => pageNumber);
+    .map(({ pageNumber }) => pageNumber)
+    .slice(0, MAX_PDF_OCR_FALLBACK_PAGES);
 
   if (weakPageNumbers.length === 0) {
     return pages;
@@ -154,7 +266,7 @@ async function runPdfOcrFallback(
     phase: "ocr",
     status: "running",
     title: `OCR احتياطي لملف ${fileName}`,
-    detail: `فشل التحليل الذكي أو تعذر الوصول إليه، لذلك يتم تشغيل OCR على ${weakPageNumbers.length} صفحات منخفضة النص فقط.`,
+    detail: `فشل التحليل الذكي أو تعذر الوصول إليه، لذلك يتم تشغيل OCR على أول ${weakPageNumbers.length} صفحات منخفضة النص فقط لتجنب التأخير الكبير.`,
     fileName,
   });
 
@@ -221,6 +333,113 @@ function chunkPageNumbers(
   return chunks;
 }
 
+function buildCadLocalTextSamplePageNumbers(totalPages: number): number[] {
+  if (totalPages <= 0) {
+    return [];
+  }
+
+  const selected = new Set<number>([1, totalPages]);
+  const targetCount = Math.min(CAD_SAMPLE_LOCAL_TEXT_PAGES, totalPages);
+
+  if (targetCount <= 2) {
+    return Array.from(selected).sort((left, right) => left - right);
+  }
+
+  const interval = Math.max(1, Math.floor(totalPages / (targetCount - 1)));
+  for (let pageNumber = 1; pageNumber <= totalPages; pageNumber += interval) {
+    selected.add(pageNumber);
+    if (selected.size >= targetCount) {
+      break;
+    }
+  }
+
+  selected.add(Math.max(1, Math.ceil(totalPages / 2)));
+
+  return Array.from(selected)
+    .filter((pageNumber) => pageNumber >= 1 && pageNumber <= totalPages)
+    .sort((left, right) => left - right)
+    .slice(0, targetCount);
+}
+
+async function readPdfSelectedPagesText(
+  pdf: PDFDocumentProxy,
+  pageNumbers: number[],
+): Promise<string[]> {
+  const pages = new Array<string>(pdf.numPages).fill("");
+
+  const selectedTexts = await mapWithConcurrency(
+    pageNumbers,
+    Math.min(PDF_TEXT_READ_CONCURRENCY, Math.max(2, pageNumbers.length)),
+    async (pageNumber) => {
+      const page = await pdf.getPage(pageNumber);
+      return {
+        pageNumber,
+        text: await readPdfPageText(page),
+      };
+    },
+  );
+
+  selectedTexts.forEach(({ pageNumber, text }) => {
+    pages[pageNumber - 1] = text;
+  });
+
+  return pages;
+}
+
+async function ensurePdfPageTexts(
+  pdf: PDFDocumentProxy,
+  pages: string[],
+  pageNumbers: number[],
+): Promise<string[]> {
+  const missingPageNumbers = pageNumbers.filter(
+    (pageNumber) => !(pages[pageNumber - 1] ?? "").trim(),
+  );
+
+  if (missingPageNumbers.length === 0) {
+    return pages;
+  }
+
+  const filledPages = [...pages];
+  const selectedTexts = await mapWithConcurrency(
+    missingPageNumbers,
+    Math.min(PDF_TEXT_READ_CONCURRENCY, Math.max(2, missingPageNumbers.length)),
+    async (pageNumber) => {
+      const page = await pdf.getPage(pageNumber);
+      return {
+        pageNumber,
+        text: await readPdfPageText(page),
+      };
+    },
+  );
+
+  selectedTexts.forEach(({ pageNumber, text }) => {
+    filledPages[pageNumber - 1] = text;
+  });
+
+  return filledPages;
+}
+
+function shouldRunAiForPdf(
+  pages: string[],
+  localDetectedDocuments: string[],
+): boolean {
+  const weakPagesCount = pages.filter(
+    (pageText) => !hasMeaningfulPdfText(pageText),
+  ).length;
+  const weakPagesRatio = pages.length > 0 ? weakPagesCount / pages.length : 1;
+  const combinedText = normalizeExtractedText(pages.join("\n\n"));
+
+  if (!hasSufficientAttachmentText(combinedText)) {
+    return true;
+  }
+
+  if (localDetectedDocuments.length === 0) {
+    return true;
+  }
+
+  return weakPagesRatio >= 0.35;
+}
+
 async function mapWithConcurrency<TItem, TResult>(
   items: TItem[],
   concurrency: number,
@@ -265,6 +484,206 @@ async function buildPdfPageImagesForAi(
         }),
       };
     },
+  );
+}
+
+async function buildPdfPageImagesForCadClassification(
+  pdf: PDFDocumentProxy,
+  pageNumbers: number[],
+): Promise<Array<{ pageNumber: number; dataUrl: string }>> {
+  return mapWithConcurrency(
+    pageNumbers,
+    Math.min(3, Math.max(1, pageNumbers.length)),
+    async (pageNumber) => {
+      const page = await pdf.getPage(pageNumber);
+      return {
+        pageNumber,
+        dataUrl: await renderPdfPageToDataUrl(page, {
+          scale: 1,
+          mimeType: "image/jpeg",
+          quality: 0.68,
+        }),
+      };
+    },
+  );
+}
+
+function sampleEvenly(pageNumbers: number[], targetCount: number): number[] {
+  if (pageNumbers.length <= targetCount) {
+    return [...pageNumbers];
+  }
+
+  if (targetCount <= 1) {
+    return pageNumbers.length > 0 ? [pageNumbers[0]] : [];
+  }
+
+  const selected = new Set<number>();
+  const lastIndex = pageNumbers.length - 1;
+
+  for (let index = 0; index < targetCount; index += 1) {
+    const ratio = index / (targetCount - 1);
+    const pageIndex = Math.round(lastIndex * ratio);
+    selected.add(pageNumbers[Math.max(0, Math.min(lastIndex, pageIndex))]);
+  }
+
+  return Array.from(selected)
+    .sort((left, right) => left - right)
+    .slice(0, targetCount);
+}
+
+function selectCadRelevantPages(
+  criticalPages: number[],
+  supportingPages: number[],
+  allPageNumbers: number[],
+): number[] {
+  if (criticalPages.length >= CAD_MAX_EXTRACTION_PAGES) {
+    return sampleEvenly(criticalPages, CAD_MAX_EXTRACTION_PAGES);
+  }
+
+  if (
+    criticalPages.length + supportingPages.length >=
+    CAD_MIN_RELEVANT_EXTRACTION_PAGES
+  ) {
+    const remainingSlots = Math.max(
+      0,
+      CAD_MAX_EXTRACTION_PAGES - criticalPages.length,
+    );
+    return [
+      ...criticalPages,
+      ...sampleEvenly(supportingPages, remainingSlots),
+    ].sort((left, right) => left - right);
+  }
+
+  return sampleEvenly(
+    allPageNumbers,
+    Math.min(CAD_MIN_RELEVANT_EXTRACTION_PAGES, allPageNumbers.length),
+  );
+}
+
+async function classifyCadPagesForExtraction(
+  file: File,
+  pdf: PDFDocumentProxy,
+  pages: string[],
+  policy: LicensePolicy,
+  reportProgress: ProgressReporter,
+): Promise<{
+  effectivePageNumbers: number[];
+  pages: string[];
+  notes: string[];
+}> {
+  const allPageNumbers = selectAllPdfPages(pdf.numPages);
+  const pageBatches = chunkPageNumbers(
+    allPageNumbers,
+    CAD_CLASSIFICATION_BATCH_SIZE,
+  );
+  const criticalPages = new Set<number>();
+  const supportingPages = new Set<number>();
+  let enrichedPages = [...pages];
+
+  reportProgress({
+    operationKey: `cad-triage-${file.name}`,
+    phase: "ai",
+    status: "running",
+    title: `فرز صفحات الملف الكبير: ${file.name}`,
+    detail: `سيتم تنفيذ مرور فرز منخفض التكلفة على ${allPageNumbers.length} صفحة لتقليل عدد الصفحات التي ستذهب إلى التحليل الأقوى لاحقاً.`,
+    fileName: file.name,
+  });
+
+  try {
+    for (const pageBatch of pageBatches) {
+      enrichedPages = await ensurePdfPageTexts(pdf, enrichedPages, pageBatch);
+      const pageImages = await buildPdfPageImagesForCadClassification(
+        pdf,
+        pageBatch,
+      );
+
+      if (pageImages.length === 0) {
+        continue;
+      }
+
+      const classification = await requestCadPageClassification({
+        fileName: file.name,
+        mimeType: file.type || "application/pdf",
+        requiredDocuments: policy.requiredDocuments,
+        pageImages,
+        localPageTexts: pageBatch.map((pageNumber) => ({
+          pageNumber,
+          text: enrichedPages[pageNumber - 1] ?? "",
+        })),
+      });
+
+      classification.pages.forEach((page) => {
+        if (page.relevance === "critical") {
+          criticalPages.add(page.pageNumber);
+          return;
+        }
+
+        if (page.relevance === "supporting") {
+          supportingPages.add(page.pageNumber);
+        }
+      });
+    }
+  } catch {
+    const fallbackPageNumbers = sampleEvenly(
+      allPageNumbers,
+      Math.min(CAD_MAX_EXTRACTION_PAGES, allPageNumbers.length),
+    );
+
+    reportProgress({
+      operationKey: `cad-triage-${file.name}`,
+      phase: "ai",
+      status: "error",
+      title: `تعذر فرز صفحات الملف الكبير: ${file.name}`,
+      detail: `تعذر تشغيل فرز الصفحات منخفض التكلفة، لذلك سيتم الاكتفاء بعينة موزعة من ${fallbackPageNumbers.length} صفحة بدلاً من إرسال الملف كاملاً.`,
+      fileName: file.name,
+    });
+
+    return {
+      effectivePageNumbers: fallbackPageNumbers,
+      pages: enrichedPages,
+      notes: [
+        `تعذر تشغيل فرز صفحات CAD، لذلك تم تحليل عينة موزعة من ${fallbackPageNumbers.length} صفحة لتقليل الضغط على حد المعدل.`,
+      ],
+    };
+  }
+
+  const effectivePageNumbers = selectCadRelevantPages(
+    Array.from(criticalPages).sort((left, right) => left - right),
+    Array.from(supportingPages).sort((left, right) => left - right),
+    allPageNumbers,
+  );
+
+  reportProgress({
+    operationKey: `cad-triage-${file.name}`,
+    phase: "ai",
+    status: "done",
+    title: `اكتمل فرز صفحات الملف الكبير: ${file.name}`,
+    detail: `تم اختيار ${effectivePageNumbers.length} صفحة فقط للتحليل الأقوى بدلاً من ${allPageNumbers.length} صفحة كاملة.`,
+    fileName: file.name,
+  });
+
+  return {
+    effectivePageNumbers,
+    pages: enrichedPages,
+    notes: [
+      `تم تنفيذ فرز صفحات CAD أولاً، ثم اختيار ${effectivePageNumbers.length} صفحة فقط للتحليل الأقوى بدلاً من ${allPageNumbers.length}.`,
+    ],
+  };
+}
+
+function shouldUseCadMode(
+  file: File,
+  pdf: PDFDocumentProxy,
+  pages: string[],
+): boolean {
+  const weakPagesCount = pages.filter(
+    (pageText) => !hasMeaningfulPdfText(pageText),
+  ).length;
+  const weakPagesRatio = pages.length > 0 ? weakPagesCount / pages.length : 1;
+
+  return (
+    pdf.numPages >= CAD_MIN_PAGES &&
+    (file.size >= CAD_MIN_FILE_SIZE_BYTES || weakPagesRatio >= 0.5)
   );
 }
 
@@ -313,6 +732,7 @@ async function readPdf(
   extractedText: string;
   detectedDocuments: string[];
   notes: string[];
+  aiConfidence?: number;
 }> {
   const buffer = await file.arrayBuffer();
   const pdf = await getDocument({ data: buffer }).promise;
@@ -326,21 +746,31 @@ async function readPdf(
     fileName: file.name,
   });
 
-  let pages = await mapWithConcurrency(
-    selectAllPdfPages(pdf.numPages),
-    PDF_TEXT_READ_CONCURRENCY,
-    async (pageNumber) => {
-      const page = await pdf.getPage(pageNumber);
-      return readPdfPageText(page);
-    },
-  );
+  const fastCadCandidate =
+    pdf.numPages >= CAD_MIN_PAGES && file.size >= CAD_MIN_FILE_SIZE_BYTES;
+
+  let pages = fastCadCandidate
+    ? await readPdfSelectedPagesText(
+        pdf,
+        buildCadLocalTextSamplePageNumbers(pdf.numPages),
+      )
+    : await mapWithConcurrency(
+        selectAllPdfPages(pdf.numPages),
+        PDF_TEXT_READ_CONCURRENCY,
+        async (pageNumber) => {
+          const page = await pdf.getPage(pageNumber);
+          return readPdfPageText(page);
+        },
+      );
 
   reportProgress({
     operationKey: `read-${file.name}`,
     phase: "read",
     status: "done",
     title: `اكتملت القراءة المحلية للملف: ${file.name}`,
-    detail: `تمت قراءة النص المضمّن محلياً من ${pdf.numPages} صفحة، ويجري الآن استكمال التحليل الذكي الكامل.`,
+    detail: fastCadCandidate
+      ? `هذا ملف كبير، لذلك تمت قراءة عينة محلية سريعة من الصفحات فقط أولاً لتسريع القرار قبل التحليل الذكي.`
+      : `تمت قراءة النص المضمّن محلياً من ${pdf.numPages} صفحة، ويجري الآن استكمال التحليل الذكي الكامل.`,
     fileName: file.name,
   });
 
@@ -353,15 +783,78 @@ async function readPdf(
       .join("\n\n"),
   ).slice(0, MAX_ATTACHMENT_TEXT_LENGTH);
 
+  const localDetection = detectDocuments(policy, extractedText, file.name);
+  if (
+    !fastCadCandidate &&
+    !shouldRunAiForPdf(pages, localDetection.detectedDocuments)
+  ) {
+    reportProgress({
+      operationKey: `ai-overall-${file.name}`,
+      phase: "ai",
+      status: "done",
+      title: `تم تجاوز التحليل الذكي المكلف: ${file.name}`,
+      detail:
+        "القراءة المحلية كانت كافية لاكتشاف المستندات المطلوبة، لذلك لم يتم إرسال كل صفحات الملف إلى النموذج.",
+      fileName: file.name,
+      detectedDocuments: localDetection.detectedDocuments,
+    });
+
+    reportProgress({
+      operationKey: `file-${file.name}`,
+      phase: "done",
+      status: "done",
+      title: `اكتمل تحليل ${file.name}`,
+      detail:
+        localDetection.detectedDocuments.length > 0
+          ? `انتهى التحليل المحلي وتم ربط الملف مبدئياً بـ ${localDetection.detectedDocuments.length} مستندات مطلوبة دون استدعاء الذكاء الاصطناعي.`
+          : "انتهى التحليل المحلي لهذا الملف دون الحاجة إلى استدعاء الذكاء الاصطناعي.",
+      fileName: file.name,
+      detectedDocuments: localDetection.detectedDocuments,
+    });
+
+    return {
+      extractedText,
+      detectedDocuments: localDetection.detectedDocuments,
+      notes: Array.from(
+        new Set([
+          ...localDetection.notes,
+          "تم الاكتفاء بالقراءة المحلية لتقليل التكلفة لأن النص المستخرج كان واضحاً بما يكفي.",
+        ]),
+      ),
+    };
+  }
+
   try {
-    const pageNumbers = selectAllPdfPages(pdf.numPages);
-    const pageBatches = chunkPageNumbers(pageNumbers, AI_PDF_BATCH_SIZE);
+    const cadMode = shouldUseCadMode(file, pdf, pages);
+    let effectivePageNumbers = selectAllPdfPages(pdf.numPages);
+    let cadTriageNotes: string[] = [];
+
+    if (cadMode) {
+      const cadTriage = await classifyCadPagesForExtraction(
+        file,
+        pdf,
+        pages,
+        policy,
+        reportProgress,
+      );
+      effectivePageNumbers = cadTriage.effectivePageNumbers;
+      pages = cadTriage.pages;
+      cadTriageNotes = cadTriage.notes;
+    }
+
+    pages = await ensurePdfPageTexts(pdf, pages, effectivePageNumbers);
+    const pageBatches = chunkPageNumbers(
+      effectivePageNumbers,
+      AI_PDF_BATCH_SIZE,
+    );
     reportProgress({
       operationKey: `ai-overall-${file.name}`,
       phase: "ai",
       status: "running",
       title: `تحليل ذكي لجميع الصفحات: ${file.name}`,
-      detail: `سيتم إرسال ${pdf.numPages} صفحة على ${pageBatches.length} دفعات متوازية لرفع سرعة المعالجة مع الحفاظ على شمول كل الصفحات.`,
+      detail: cadMode
+        ? `هذا ملف CAD كبير، لذلك سيتم إرسال ${effectivePageNumbers.length} صفحة مرشحة فقط بعد فرز أولي منخفض التكلفة، بدلاً من إرسال الملف كاملاً.`
+        : `سيتم إرسال جميع صفحات الملف (${effectivePageNumbers.length} صفحة) على ${pageBatches.length} دفعات متوازية حتى لا يتم تجاهل أي صفحة.`,
       fileName: file.name,
     });
 
@@ -393,10 +886,11 @@ async function readPdf(
           fileName: file.name,
           mimeType: file.type || "application/pdf",
           requiredDocuments: policy.requiredDocuments,
-          localExtractedText: extractedText.slice(
-            0,
-            MAX_AI_ATTACHMENT_TEXT_LENGTH,
-          ),
+          extractionMode: cadMode ? "cad-critical" : "standard",
+          localExtractedText: pageBatch
+            .map((pageNumber) => pages[pageNumber - 1] ?? "")
+            .join("\n\n")
+            .slice(0, MAX_AI_ATTACHMENT_TEXT_LENGTH),
           pageImages,
         });
 
@@ -422,6 +916,9 @@ async function readPdf(
           detectedDocuments: aiExtraction.detectedDocuments ?? [],
           notes: aiExtraction.notes ?? [],
           extractedText: aiExtraction.extractedText ?? "",
+          confidence: Number.isFinite(aiExtraction.confidence)
+            ? aiExtraction.confidence
+            : 0,
         };
       },
     );
@@ -429,13 +926,27 @@ async function readPdf(
     const aiDetectedDocuments = new Set<string>();
     const aiNotes: string[] = [];
     const aiTexts: string[] = [];
+    const aiConfidences: number[] = [];
 
     batchResults.forEach(
-      ({ pageBatch, detectedDocuments, notes, extractedText: batchText }) => {
+      ({
+        pageBatch,
+        detectedDocuments,
+        notes,
+        extractedText: batchText,
+        confidence,
+      }) => {
         detectedDocuments.forEach((documentName) =>
           aiDetectedDocuments.add(documentName),
         );
         aiNotes.push(...notes);
+        if (
+          typeof confidence === "number" &&
+          Number.isFinite(confidence) &&
+          confidence > 0
+        ) {
+          aiConfidences.push(confidence);
+        }
         if (batchText) {
           aiTexts.push(`[[ai-pages:${pageBatch.join(",")}]]\n${batchText}`);
         }
@@ -446,10 +957,14 @@ async function readPdf(
       [extractedText, ...aiTexts].filter(Boolean).join("\n\n"),
     ).slice(0, MAX_ATTACHMENT_TEXT_LENGTH);
 
-    const notes = Array.from(new Set(aiNotes));
+    const notes = Array.from(
+      new Set([...localDetection.notes, ...cadTriageNotes, ...aiNotes]),
+    );
     if (aiTexts.length > 0) {
       notes.push(
-        `تمت إضافة قراءة ذكية على جميع صفحات الملف وعددها ${pageNumbers.length} صفحة.`,
+        cadMode
+          ? `تم استخدام وضع CAD الاقتصادي: جرى فرز الصفحات أولاً ثم تحليل ${effectivePageNumbers.length} صفحة مرشحة فقط بالنموذج الأقوى.`
+          : `تمت إضافة قراءة ذكية على جميع صفحات الملف (${effectivePageNumbers.length} صفحة).`,
       );
     }
 
@@ -458,7 +973,7 @@ async function readPdf(
       phase: "ai",
       status: "done",
       title: `اكتمل التحليل الذكي لجميع الصفحات: ${file.name}`,
-      detail: `اكتملت جميع دفعات الذكاء الاصطناعي للملف بعد تحليل ${pageNumbers.length} صفحة.`,
+      detail: `اكتملت جميع دفعات الذكاء الاصطناعي للملف بعد تحليل ${effectivePageNumbers.length} صفحات مرشحة.`,
       fileName: file.name,
       detectedDocuments: Array.from(aiDetectedDocuments),
     });
@@ -480,6 +995,13 @@ async function readPdf(
       extractedText,
       detectedDocuments: Array.from(aiDetectedDocuments),
       notes,
+      aiConfidence:
+        aiConfidences.length > 0
+          ? Math.round(
+              aiConfidences.reduce((sum, value) => sum + value, 0) /
+                aiConfidences.length,
+            )
+          : undefined,
     };
   } catch {
     pages = await runPdfOcrFallback(pdf, pages, file.name, reportProgress);
@@ -508,6 +1030,7 @@ async function readPdf(
       notes: [
         "تعذر تشغيل الاستخراج الذكي من الخادم، وتم الاعتماد على القراءة المحلية فقط.",
       ],
+      aiConfidence: 0,
     };
   }
 }
@@ -537,6 +1060,7 @@ async function extractText(
   extractedText: string;
   detectedDocuments: string[];
   notes: string[];
+  aiConfidence?: number;
 }> {
   const lowerName = file.name.toLowerCase();
 
@@ -567,6 +1091,7 @@ async function extractText(
       extractedText: await readDocx(file),
       detectedDocuments: [],
       notes: [],
+      aiConfidence: undefined,
     };
   }
   if (
@@ -588,6 +1113,7 @@ async function extractText(
       extractedText: await readTextLikeFile(file),
       detectedDocuments: [],
       notes: [],
+      aiConfidence: undefined,
     };
   }
   if (file.type.startsWith("image/")) {
@@ -604,6 +1130,7 @@ async function extractText(
       extractedText: await readImageWithOcr(file),
       detectedDocuments: [],
       notes: [],
+      aiConfidence: undefined,
     };
   }
 
@@ -613,6 +1140,7 @@ async function extractText(
       extractedText: await readTextLikeFile(file),
       detectedDocuments: [],
       notes: [],
+      aiConfidence: undefined,
     };
   } catch {
     return {
@@ -620,6 +1148,7 @@ async function extractText(
       extractedText: "",
       detectedDocuments: [],
       notes: [],
+      aiConfidence: undefined,
     };
   }
 }
@@ -638,13 +1167,16 @@ export async function analyzeAttachments(
     detail: `تم استلام ${files.length} ملفات، وسيتم تحليلها وربطها بمستندات السياسة المختارة خطوة بخطوة.`,
   });
 
-  const attachments = await Promise.all(
-    files.map(async (file) => {
+  const attachments = await mapWithConcurrency(
+    files,
+    MAX_PARALLEL_ATTACHMENT_ANALYSIS,
+    async (file) => {
       const {
         sourceType,
         extractedText,
         detectedDocuments: seededDocuments,
         notes: seededNotes,
+        aiConfidence,
       } = await extractText(file, policy, reportProgress);
       const { detectedDocuments, notes } = detectDocuments(
         policy,
@@ -667,7 +1199,77 @@ export async function analyzeAttachments(
         detectedDocuments,
       });
 
-      return {
+      reportProgress({
+        operationKey: `validate-${file.name}`,
+        phase: "ai",
+        status: "running",
+        title: `AI validation for ${file.name}`,
+        detail:
+          "A dedicated AI validation request is being sent for this uploaded file to verify the slot match and return reviewer feedback.",
+        fileName: file.name,
+        detectedDocuments,
+      });
+
+      let aiValidation: AttachmentAiValidation | undefined;
+      try {
+        const validationResult = await requestAttachmentValidation({
+          fileName: file.name,
+          mimeType: file.type || "application/octet-stream",
+          sourceType,
+          requiredDocuments: policy.requiredDocuments,
+          expectedDocument: policy.requiredDocuments[0],
+          extractedText,
+          detectedDocuments,
+          notes,
+        });
+
+        aiValidation = {
+          status: validationResult.status,
+          summary: validationResult.summary,
+          feedback: validationResult.feedback,
+          confidence: validationResult.confidence,
+          model: validationResult.model,
+          checklistResults: validationResult.checklistResults,
+        };
+
+        reportProgress({
+          operationKey: `validate-${file.name}`,
+          phase: "ai",
+          status: "done",
+          title: `AI validation completed for ${file.name}`,
+          detail: validationResult.summary,
+          fileName: file.name,
+          detectedDocuments,
+          model: validationResult.model,
+          responseSummary: validationResult.feedback.join(" | ").slice(0, 220),
+        });
+      } catch {
+        reportProgress({
+          operationKey: `validate-${file.name}`,
+          phase: "ai",
+          status: "error",
+          title: `تعذر التحقق الذكي للملف ${file.name}`,
+          detail:
+            "فشل طلب التحقق المخصص لهذا الملف، لذلك لن يتم عرض ملاحظات تحقق مولدة محلياً بدلاً من رد النموذج.",
+          fileName: file.name,
+          detectedDocuments,
+        });
+      }
+
+      if (aiValidation) {
+        reportProgress({
+          operationKey: `validate-${file.name}`,
+          phase: "ai",
+          status: "done",
+          title: `اكتمل تحقق الملف ${file.name}`,
+          detail: aiValidation.summary,
+          fileName: file.name,
+          model: aiValidation.model,
+          detectedDocuments,
+        });
+      }
+
+      const attachment = {
         id: buildAttachmentId(file),
         name: file.name,
         mimeType: file.type,
@@ -677,8 +1279,11 @@ export async function analyzeAttachments(
         excerpt: summarizeText(extractedText),
         detectedDocuments,
         notes,
+        preview: await buildAttachmentPreview(file, sourceType, extractedText),
+        aiValidation,
       } satisfies UploadedAttachment;
-    }),
+      return attachment;
+    },
   );
 
   reportProgress({

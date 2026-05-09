@@ -5,7 +5,8 @@
   "outputDirectory": "dist",
   "functions": {
     "api/[...route].mjs": {
-      "includeFiles": "sources/**,src/data/policyKnowledgeBase.generated.json"
+      "includeFiles": "sources/**,src/data/policyKnowledgeBase.generated.json",
+      "maxDuration": 60
     }
   }
 }

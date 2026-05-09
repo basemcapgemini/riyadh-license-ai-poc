@@ -5,14 +5,99 @@ import express from "express";
 import dotenv from "dotenv";
 import mammoth from "mammoth";
 import OpenAI from "openai";
+import XLSX from "xlsx";
 import knowledgeBaseJson from "../src/data/policyKnowledgeBase.generated.json" with { type: "json" };
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const projectRoot = path.resolve(__dirname, "..");
+const workspaceRoot = path.resolve(projectRoot, "..");
 const sourceAssetsRoot = path.join(projectRoot, "sources");
 const distRoot = path.join(projectRoot, "dist");
 const DEFAULT_REVIEW_MODEL = "gpt-4o-mini";
 const DEFAULT_EXTRACTION_MODEL = "gpt-4o-mini";
+const DEFAULT_CAD_CLASSIFIER_MODEL = "gpt-4o-mini";
+const DEFAULT_CROSS_MODEL_FALLBACKS = ["gpt-4.1-mini", "gpt-4.1-nano"];
+const RATE_LIMIT_RETRY_PADDING_MS = 180;
+const DEFAULT_RATE_LIMIT_RETRY_DELAY_MS = 900;
+const MAX_RATE_LIMIT_TOTAL_WAIT_MS = 12 * 60 * 1000;
+const MAX_RATE_LIMIT_TOTAL_ATTEMPTS = 80;
+const DEFAULT_NOTES_FOR_CHECK_PATH = path.join(
+  workspaceRoot,
+  "accelerator",
+  "notes for check (1).xlsx",
+);
+const DEFAULT_NOTES_FOR_CHECK_FALLBACK_ITEMS = [
+  {
+    sheetName: "Checklist",
+    rowNumber: 1,
+    section: "تدقيق معماري",
+    kind: "architectural",
+    text: "الارتدادات النظامية",
+  },
+  {
+    sheetName: "Checklist",
+    rowNumber: 2,
+    section: "تدقيق معماري",
+    kind: "architectural",
+    text: "نسبة البناء",
+  },
+  {
+    sheetName: "Checklist",
+    rowNumber: 3,
+    section: "تدقيق معماري",
+    kind: "architectural",
+    text: "عدد الأدوار والارتفاع",
+  },
+  {
+    sheetName: "Checklist",
+    rowNumber: 4,
+    section: "تدقيق معماري",
+    kind: "architectural",
+    text: "مواقف السيارات",
+  },
+  {
+    sheetName: "Checklist",
+    rowNumber: 5,
+    section: "تدقيق معماري",
+    kind: "architectural",
+    text: "مساحات الغرف والفراغات",
+  },
+  {
+    sheetName: "Checklist",
+    rowNumber: 6,
+    section: "تدقيق معماري",
+    kind: "architectural",
+    text: "متطلبات ذوي الإعاقة (إن وجد)",
+  },
+  {
+    sheetName: "Checklist",
+    rowNumber: 7,
+    section: "تدقيق معماري",
+    kind: "architectural",
+    text: "الاستخدام مطابق للتصنيف",
+  },
+  {
+    sheetName: "Checklist",
+    rowNumber: 8,
+    section: "مطابقات",
+    kind: "consistency",
+    text: "مطابقة الاستخدام بين (الصك . الرخصة السابقة . نظام البناء)",
+  },
+  {
+    sheetName: "Checklist",
+    rowNumber: 9,
+    section: "مطابقات",
+    kind: "consistency",
+    text: "مطابقة المساحات بين ( التقرير الفني . المخطط المعماري .النظام الإلكتروني)",
+  },
+  {
+    sheetName: "Checklist",
+    rowNumber: 10,
+    section: "مطابقات",
+    kind: "consistency",
+    text: "مراجعه الواجهات المحليه ( كليشه)",
+  },
+];
 const AI_TRACKED_DOCUMENTS = [
   "المخططات المعمارية",
   "المخطط الإنشائي",
@@ -23,13 +108,628 @@ const AI_TRACKED_DOCUMENTS = [
   "نظام البناء المعتمد من إدارة الرخص",
 ];
 
+const CHECKLIST_DOCUMENT_CATALOG = {
+  "صورة بطاقة الأحوال المدنية": "1",
+  "صورة الصك": "2",
+  "تقرير مساحي في القطاع مع منسوب": "3",
+  "صورة جزئية من المخطط التنظيمي": "4",
+  اقرارات: "7",
+  "إيصال سداد الرسوم": "8",
+  "نموذج تدقيق نظام اشتراطات": "9",
+  "شهادة الإشغال": "15",
+  "صورة جزئية للموقع (كروكي)": "16",
+  "إقرار المالك بتنفيذ لائحة الضوابط 9": "21",
+  "تعهد المكتب الهندسي المشرف": "22",
+  "صورة رخصة البناء": "24",
+  "محضر تجزئة": "26",
+  "شهادة تحمل": "30",
+  "صورة من الوكالة الشرعية": "31",
+  "صورة لواجهة المبنى": "34",
+  "السجل التجاري": "37",
+  "تقرير فني": "44",
+  "مخططات الدفاع المدني": "46",
+  "المخططات المعمارية": "48",
+  "موافقة التربية والتعليم": "60",
+  "تعهد المخلفات": "63",
+  "عقد اشراف": "64",
+  "تقرير دراسة التربة": "69",
+  "الرفع المساحي من مكتب هندسي": "70",
+  "خطاب توجيه": "76",
+  "خطاب موافقة الزراعة": "77",
+  "ملاحظات بلدية": "78",
+  "الموقع العام": "79",
+  "محضر لجنة فنية": "80",
+  "المخطط المقترح بعد التعديل": "82",
+  "تعهد تنفيذ العزل الحراري": "83",
+  "مخطط الوضع القائم": "84",
+  "صورة الرخصة القديمة": "86",
+  "المخطط المعتمد": "87",
+  "خطاب الدفاع المدني": "88",
+  "وثيقة التأمين": "98",
+  "عقد تفويض المالك للمقاول المنفذ للمشروع": "100",
+  "المخطط الكهربائي": "102",
+  "المخطط الإنشائي": "103",
+  "رخصة هدم": "106",
+  "مخططات كفاءة الطاقة": "107",
+  "المخططات الميكانيكية": "108",
+  "صورة من الطبيعة": "117",
+  "عقد الإيجار": "118",
+  "شهادة تسجيل وقف": "125",
+  "تعهد إغلاق فتحات الخزان": "133",
+  "نموذج الواجهات": "135",
+};
+
+const modelRateLimitAvailability = new Map();
+
+const CHAT_JSON_VISION_MODEL_PATTERNS = [
+  /^gpt-test/i,
+  /^gpt-4o(?:-|$)/i,
+  /^gpt-4\.1(?:-|$)/i,
+  /^gpt-5(?:[.-]|$)/i,
+  /^o4-mini(?:-|$)?/i,
+];
+
+const CLEARLY_UNSUPPORTED_MODEL_PATTERNS = [
+  {
+    pattern: /^gpt-image/i,
+    reason:
+      "هذا نموذج مخصص لتوليد أو تحرير الصور، وليس لمهام JSON النصية أو البصرية في هذا الخادم.",
+  },
+  {
+    pattern: /tts/i,
+    reason: "هذا نموذج تحويل نص إلى صوت، ولا يصلح لطلبات JSON الحالية.",
+  },
+  {
+    pattern: /transcribe/i,
+    reason: "هذا نموذج تفريغ صوتي، ولا يصلح لطلبات JSON الحالية.",
+  },
+  {
+    pattern: /realtime/i,
+    reason: "هذا نموذج وقت حقيقي، وليس الخيار المناسب لنقطة النهاية الحالية.",
+  },
+  {
+    pattern: /embedding/i,
+    reason: "هذا نموذج embeddings، ولا يعيد بنية JSON المطلوبة هنا.",
+  },
+  {
+    pattern: /moderation/i,
+    reason:
+      "هذا نموذج moderation، وليس للمراجعة أو الاستخراج أو الرؤية متعددة الوسائط.",
+  },
+];
+
+const TASK_MODEL_ROUTING = {
+  attachmentValidation: {
+    needsTextJson: true,
+    needsVisionJson: false,
+    strategy: "cheapest-compatible",
+    roleOrder: ["extractionModel", "reviewModel", "fallbackModels"],
+  },
+  attachmentExtractionStandard: {
+    needsTextJson: true,
+    needsVisionJson: true,
+    strategy: "cheapest-compatible",
+    roleOrder: [
+      "extractionModel",
+      "cadClassifierModel",
+      "reviewModel",
+      "fallbackModels",
+      "cadCriticalModel",
+    ],
+  },
+  attachmentExtractionCadCritical: {
+    needsTextJson: true,
+    needsVisionJson: true,
+    strategy: "capability-first",
+    roleOrder: [
+      "cadCriticalModel",
+      "reviewModel",
+      "extractionModel",
+      "fallbackModels",
+      "cadClassifierModel",
+    ],
+  },
+  cadPageClassification: {
+    needsTextJson: true,
+    needsVisionJson: true,
+    strategy: "cheapest-compatible",
+    roleOrder: [
+      "cadClassifierModel",
+      "extractionModel",
+      "reviewModel",
+      "fallbackModels",
+      "cadCriticalModel",
+    ],
+  },
+  llmReview: {
+    needsTextJson: true,
+    needsVisionJson: false,
+    strategy: "pinned-primary",
+    roleOrder: ["reviewModel", "extractionModel", "fallbackModels"],
+  },
+};
+
+function getEnvironmentCandidates(root = projectRoot) {
+  const currentWorkingDirectory = process.cwd();
+  const configuredEnvPath = String(
+    process.env.AI_ACCELERATOR_ENV_PATH || "",
+  ).trim();
+
+  return [
+    path.resolve(root, ".env"),
+    path.resolve(root, ".env.local"),
+    path.resolve(currentWorkingDirectory, ".env"),
+    path.resolve(currentWorkingDirectory, ".env.local"),
+    path.resolve(workspaceRoot, "accelerator/.env"),
+    path.resolve(workspaceRoot, "accelerator/.env.local"),
+    configuredEnvPath,
+  ].filter(Boolean);
+}
+
+function getModelCapability(modelName) {
+  const normalizedModelName = String(modelName || "").trim();
+
+  if (!normalizedModelName) {
+    return {
+      model: normalizedModelName,
+      supportsTextJson: false,
+      supportsVisionJson: false,
+      reason: "اسم النموذج غير محدد.",
+    };
+  }
+
+  const unsupportedMatch = CLEARLY_UNSUPPORTED_MODEL_PATTERNS.find(
+    ({ pattern }) => pattern.test(normalizedModelName),
+  );
+  if (unsupportedMatch) {
+    return {
+      model: normalizedModelName,
+      supportsTextJson: false,
+      supportsVisionJson: false,
+      reason: unsupportedMatch.reason,
+    };
+  }
+
+  const supportsChatJsonVision = CHAT_JSON_VISION_MODEL_PATTERNS.some(
+    (pattern) => pattern.test(normalizedModelName),
+  );
+  if (supportsChatJsonVision) {
+    return {
+      model: normalizedModelName,
+      supportsTextJson: true,
+      supportsVisionJson: true,
+      reason: "يدعم مهام النص وJSON والرؤية المطلوبة في هذا الخادم.",
+    };
+  }
+
+  return {
+    model: normalizedModelName,
+    supportsTextJson: false,
+    supportsVisionJson: false,
+    reason:
+      "هذا النموذج ليس ضمن العائلات التي تم التحقق منها لهذا الخادم. استخدم gpt-4o* أو gpt-4.1* أو gpt-5* أو o4-mini، أو عرّف نموذج اختبار داخلي.",
+  };
+}
+
+function getModelHeuristics(modelName) {
+  const normalizedModelName = String(modelName || "")
+    .trim()
+    .toLowerCase();
+
+  if (!normalizedModelName) {
+    return {
+      costRank: null,
+      capabilityRank: null,
+    };
+  }
+
+  if (/nano/.test(normalizedModelName)) {
+    return {
+      costRank: 0,
+      capabilityRank: 0,
+    };
+  }
+
+  if (/mini/.test(normalizedModelName)) {
+    return {
+      costRank: /^o4-mini(?:-|$)?/i.test(normalizedModelName) ? 2 : 1,
+      capabilityRank: /^gpt-5/i.test(normalizedModelName) ? 4 : 1,
+    };
+  }
+
+  if (/^gpt-4o(?:-|$)/i.test(normalizedModelName)) {
+    return {
+      costRank: 3,
+      capabilityRank: 2,
+    };
+  }
+
+  if (/^gpt-4\.1(?:-|$)/i.test(normalizedModelName)) {
+    return {
+      costRank: 4,
+      capabilityRank: 3,
+    };
+  }
+
+  if (/^gpt-5(?:-|$)/i.test(normalizedModelName)) {
+    return {
+      costRank: 5,
+      capabilityRank: 5,
+    };
+  }
+
+  return {
+    costRank: null,
+    capabilityRank: null,
+  };
+}
+
+function collectTaskModelEntries(taskConfig, modelAssignments) {
+  const entries = [];
+
+  taskConfig.roleOrder.forEach((roleName) => {
+    const modelValues = splitModelList(modelAssignments[roleName]);
+
+    modelValues.forEach((modelName) => {
+      const normalizedModelName = String(modelName || "").trim();
+      if (!normalizedModelName) {
+        return;
+      }
+
+      entries.push({
+        model: normalizedModelName,
+        role: roleName,
+        sourceOrder: entries.length,
+      });
+    });
+  });
+
+  return Array.from(
+    new Map(entries.map((entry) => [entry.model, entry])).values(),
+  );
+}
+
+function compareByKnownCost(leftEntry, rightEntry) {
+  const leftHeuristics = getModelHeuristics(leftEntry.model);
+  const rightHeuristics = getModelHeuristics(rightEntry.model);
+
+  if (
+    Number.isFinite(leftHeuristics.costRank) &&
+    Number.isFinite(rightHeuristics.costRank) &&
+    leftHeuristics.costRank !== rightHeuristics.costRank
+  ) {
+    return leftHeuristics.costRank - rightHeuristics.costRank;
+  }
+
+  return leftEntry.sourceOrder - rightEntry.sourceOrder;
+}
+
+function compareByCapabilityThenCost(leftEntry, rightEntry) {
+  const leftHeuristics = getModelHeuristics(leftEntry.model);
+  const rightHeuristics = getModelHeuristics(rightEntry.model);
+
+  if (
+    Number.isFinite(leftHeuristics.capabilityRank) &&
+    Number.isFinite(rightHeuristics.capabilityRank) &&
+    leftHeuristics.capabilityRank !== rightHeuristics.capabilityRank
+  ) {
+    return rightHeuristics.capabilityRank - leftHeuristics.capabilityRank;
+  }
+
+  return compareByKnownCost(leftEntry, rightEntry);
+}
+
+function buildTaskModelPlan(taskName, modelAssignments) {
+  const taskConfig = TASK_MODEL_ROUTING[taskName];
+  if (!taskConfig) {
+    throw new Error(`Unknown AI task routing profile: ${taskName}`);
+  }
+
+  const compatibleEntries = collectTaskModelEntries(
+    taskConfig,
+    modelAssignments,
+  ).filter((entry) => {
+    const capability = getModelCapability(entry.model);
+    return (
+      (!taskConfig.needsTextJson || capability.supportsTextJson) &&
+      (!taskConfig.needsVisionJson || capability.supportsVisionJson)
+    );
+  });
+
+  const primaryEntries = compatibleEntries.filter(
+    (entry) => entry.role !== "fallbackModels",
+  );
+  const fallbackEntries = compatibleEntries.filter(
+    (entry) => entry.role === "fallbackModels",
+  );
+
+  const sortEntries = (entries) => {
+    if (taskConfig.strategy === "capability-first") {
+      return [...entries].sort(compareByCapabilityThenCost);
+    }
+
+    return [...entries].sort(compareByKnownCost);
+  };
+
+  let sortedPrimaryEntries = sortEntries(primaryEntries);
+  if (taskConfig.strategy === "pinned-primary" && primaryEntries.length > 0) {
+    const [pinnedPrimaryEntry, ...remainingEntries] = primaryEntries;
+    sortedPrimaryEntries = [
+      pinnedPrimaryEntry,
+      ...sortEntries(remainingEntries),
+    ];
+  }
+
+  const [selectedPrimaryEntry, ...remainingPrimaryEntries] =
+    sortedPrimaryEntries;
+  const primaryModel =
+    selectedPrimaryEntry?.model ||
+    fallbackEntries[0]?.model ||
+    modelAssignments.reviewModel;
+  const fallbackModels = collectCandidateModels(
+    "",
+    [
+      ...fallbackEntries.map((entry) => entry.model),
+      ...remainingPrimaryEntries.map((entry) => entry.model),
+    ].filter((modelName) => modelName && modelName !== primaryModel),
+  );
+
+  return {
+    model: primaryModel,
+    primaryModel,
+    fallbackModels,
+  };
+}
+
+function validateModelAssignments({
+  reviewModel,
+  extractionModel,
+  cadClassifierModel,
+  cadCriticalModel,
+  fallbackModels,
+}) {
+  const validationChecks = [
+    {
+      role: "reviewModel",
+      model: reviewModel,
+      needsTextJson: true,
+      needsVisionJson: false,
+    },
+    {
+      role: "extractionModel",
+      model: extractionModel,
+      needsTextJson: true,
+      needsVisionJson: true,
+    },
+    {
+      role: "cadClassifierModel",
+      model: cadClassifierModel,
+      needsTextJson: true,
+      needsVisionJson: true,
+    },
+    {
+      role: "cadCriticalModel",
+      model: cadCriticalModel,
+      needsTextJson: true,
+      needsVisionJson: true,
+    },
+    ...fallbackModels.map((modelName, index) => ({
+      role: `fallbackModels[${index}]`,
+      model: modelName,
+      needsTextJson: true,
+      needsVisionJson: true,
+    })),
+  ];
+
+  const failures = validationChecks
+    .map((check) => {
+      const capability = getModelCapability(check.model);
+      const missingRequirements = [
+        check.needsTextJson && !capability.supportsTextJson
+          ? "text+json"
+          : null,
+        check.needsVisionJson && !capability.supportsVisionJson
+          ? "vision+json"
+          : null,
+      ].filter(Boolean);
+
+      if (missingRequirements.length === 0) {
+        return null;
+      }
+
+      return `${check.role}=${check.model} يفتقد ${missingRequirements.join(" و ")}. ${capability.reason}`;
+    })
+    .filter(Boolean);
+
+  if (failures.length > 0) {
+    throw new Error(
+      `فشل التحقق من توافق النماذج المعرّفة لهذا الخادم: ${failures.join(" ")}`,
+    );
+  }
+}
+
 export function loadEnvironment(root = projectRoot) {
-  dotenv.config({ path: path.resolve(root, ".env"), override: false });
-  dotenv.config({ path: path.resolve(root, ".env.local"), override: false });
+  const attemptedPaths = new Set();
+
+  getEnvironmentCandidates(root).forEach((candidatePath) => {
+    const resolvedPath = path.resolve(candidatePath);
+    if (attemptedPaths.has(resolvedPath) || !existsSync(resolvedPath)) {
+      return;
+    }
+
+    attemptedPaths.add(resolvedPath);
+    dotenv.config({ path: resolvedPath, override: false });
+  });
 }
 
 function loadKnowledgeBase(root = projectRoot) {
   return knowledgeBaseJson;
+}
+
+function buildFallbackNotesForCheckContext(resolvedPath) {
+  return {
+    sourcePath: resolvedPath,
+    fileName: path.basename(resolvedPath),
+    checklistItems: DEFAULT_NOTES_FOR_CHECK_FALLBACK_ITEMS,
+  };
+}
+
+function loadNotesForCheckContext(
+  workbookPath = process.env.NOTES_FOR_CHECK_SOURCE_PATH ||
+    DEFAULT_NOTES_FOR_CHECK_PATH,
+) {
+  const resolvedPath = path.resolve(workbookPath);
+  if (!existsSync(resolvedPath)) {
+    return buildFallbackNotesForCheckContext(resolvedPath);
+  }
+
+  try {
+    const workbook = XLSX.readFile(resolvedPath, { cellDates: false });
+    const checklistItems = [];
+    const seen = new Set();
+
+    for (const sheetName of workbook.SheetNames) {
+      const worksheet = workbook.Sheets[sheetName];
+      const rows = XLSX.utils.sheet_to_json(worksheet, {
+        header: 1,
+        defval: "",
+        raw: false,
+      });
+
+      let currentSection = "";
+
+      rows.forEach((row, index) => {
+        const cells = Array.isArray(row)
+          ? row.map((cell) => String(cell || "").trim())
+          : [];
+        const values = cells.filter(Boolean);
+        if (values.length === 0) {
+          return;
+        }
+
+        const sectionCandidate = cells[1];
+        if (sectionCandidate && !/^\d+(?:\.\d+)?$/u.test(sectionCandidate)) {
+          currentSection = sectionCandidate;
+        }
+
+        const descriptiveCells = values.filter(
+          (value) =>
+            value !== currentSection && !/^\d+(?:\.\d+)?$/u.test(value),
+        );
+        const itemText = normalizeText(
+          cells[3] || descriptiveCells[descriptiveCells.length - 1],
+          220,
+        );
+        const kind = classifyNotesForCheckItemKind(currentSection, itemText);
+        const normalized = normalizeArabic(`${kind}|${itemText}`);
+        if (
+          !itemText ||
+          itemText === currentSection ||
+          !normalized ||
+          seen.has(normalized) ||
+          /^sheet\s*\d+$/i.test(itemText)
+        ) {
+          return;
+        }
+
+        seen.add(normalized);
+        checklistItems.push({
+          sheetName,
+          rowNumber: index + 1,
+          section: currentSection || sheetName,
+          kind,
+          text: itemText,
+        });
+      });
+    }
+
+    const normalizedContext = {
+      sourcePath: resolvedPath,
+      fileName: path.basename(resolvedPath),
+      checklistItems: checklistItems.slice(0, 220),
+    };
+
+    return normalizedContext.checklistItems.length > 0
+      ? normalizedContext
+      : buildFallbackNotesForCheckContext(resolvedPath);
+  } catch (error) {
+    console.error("Failed to load Notes for Check workbook", {
+      sourcePath: resolvedPath,
+      message: error instanceof Error ? error.message : String(error),
+    });
+    return buildFallbackNotesForCheckContext(resolvedPath);
+  }
+}
+
+function classifyNotesForCheckItemKind(sectionName, itemText) {
+  const normalizedSection = normalizeArabic(sectionName || "");
+  const normalizedItem = normalizeArabic(itemText || "");
+
+  if (
+    normalizedSection.includes("مطابقات") ||
+    normalizedItem.startsWith("مطابقة ")
+  ) {
+    return "consistency";
+  }
+
+  return "architectural";
+}
+
+function normalizeNotesForCheckEntry(entry) {
+  if (typeof entry === "string") {
+    const text = normalizeText(entry, 220);
+    if (!text) {
+      return null;
+    }
+
+    return {
+      sheetName: "Checklist",
+      rowNumber: 0,
+      section: "Checklist",
+      kind: classifyNotesForCheckItemKind("", text),
+      text,
+    };
+  }
+
+  if (!entry || typeof entry !== "object") {
+    return null;
+  }
+
+  const text = normalizeText(entry.text, 220);
+  if (!text) {
+    return null;
+  }
+
+  const section =
+    normalizeText(entry.section || entry.sheetName, 120) || "Checklist";
+  return {
+    sheetName: normalizeText(entry.sheetName, 120) || "Checklist",
+    rowNumber: Number(entry.rowNumber) || 0,
+    section,
+    kind:
+      entry.kind === "consistency" || entry.kind === "architectural"
+        ? entry.kind
+        : classifyNotesForCheckItemKind(section, text),
+    text,
+  };
+}
+
+function partitionNotesForCheckItems(checklistItems) {
+  const normalizedEntries = (
+    Array.isArray(checklistItems) ? checklistItems : []
+  )
+    .map((item) => normalizeNotesForCheckEntry(item))
+    .filter(Boolean);
+
+  return {
+    allEntries: normalizedEntries,
+    architecturalItems: normalizedEntries
+      .filter((item) => item.kind === "architectural")
+      .map((item) => item.text),
+    consistencyItems: normalizedEntries
+      .filter((item) => item.kind === "consistency")
+      .map((item) => item.text),
+  };
 }
 
 function normalizeArabic(value) {
@@ -84,9 +784,42 @@ function compactAttachments(attachments) {
     name: attachment.name,
     sourceType: attachment.sourceType,
     detectedDocuments: attachment.detectedDocuments,
+    detectedDocumentsDetailed: attachment.detectedDocuments.map(
+      (documentName) => ({
+        number: CHECKLIST_DOCUMENT_CATALOG[documentName] || "",
+        title: documentName,
+      }),
+    ),
     notes: attachment.notes,
     extractedText: String(attachment.extractedText || "").slice(0, 3500),
   }));
+}
+
+function resolveSelectedProjectType(policy, submission) {
+  const projectTypeGroups = Array.isArray(policy?.projectTypes)
+    ? policy.projectTypes
+    : [];
+  const selectedGroup = projectTypeGroups.find(
+    (group) => group.id === submission?.projectTypeGroupId,
+  );
+  const selectedSubtype = selectedGroup?.subtypes?.find(
+    (subtype) => subtype.id === submission?.projectSubtypeId,
+  );
+
+  return {
+    selectedGroup,
+    selectedSubtype,
+    availableGroups: projectTypeGroups.map((group) => ({
+      id: group.id,
+      title: group.title,
+      subtypes: Array.isArray(group.subtypes)
+        ? group.subtypes.map((subtype) => ({
+            id: subtype.id,
+            title: subtype.title,
+          }))
+        : [],
+    })),
+  };
 }
 
 function buildKnowledgeContext(
@@ -228,6 +961,35 @@ function normalizeSuggestedResponseActionType(value) {
     : "request-completion";
 }
 
+function normalizeAttachmentValidationStatus(value) {
+  return value === "passed" || value === "warning" || value === "missing"
+    ? value
+    : "warning";
+}
+
+function normalizeAttachmentChecklistStatus(value) {
+  return value === "Compliant" ||
+    value === "Non-Compliant" ||
+    value === "Not Found"
+    ? value
+    : "Not Found";
+}
+
+function isArchitecturalPlansDocumentCandidate(value) {
+  const normalizedValue = normalizeArabic(String(value || ""));
+  return (
+    normalizedValue.includes(normalizeArabic("المخططات المعمارية")) ||
+    normalizedValue.includes(normalizeArabic("مخططات معمارية")) ||
+    normalizedValue.includes(normalizeArabic("مخطط معماري"))
+  );
+}
+
+function normalizeCadPageRelevance(value) {
+  return value === "critical" || value === "supporting" || value === "ignore"
+    ? value
+    : "ignore";
+}
+
 function normalizeDocumentValidations(
   value,
   allowedDocuments,
@@ -330,6 +1092,853 @@ function normalizeSuggestedResponses(value, maxItems = 6) {
     })
     .filter(Boolean)
     .slice(0, maxItems);
+}
+
+function normalizeValueFromSet(value, allowedValues, fallbackValue) {
+  return allowedValues.includes(value) ? value : fallbackValue;
+}
+
+function normalizeConfidenceLevel(value, confidence = 0) {
+  if (value === "High" || value === "Medium" || value === "Low") {
+    return value;
+  }
+
+  if (confidence >= 75) return "High";
+  if (confidence >= 45) return "Medium";
+  return "Low";
+}
+
+function normalizeIndicDigits(value) {
+  return String(value || "").replace(/[٠-٩]/g, (digit) =>
+    String(digit.charCodeAt(0) - 1632),
+  );
+}
+
+function normalizeComparableValue(value) {
+  return normalizeArabic(normalizeIndicDigits(value || ""));
+}
+
+function escapeRegex(value) {
+  return String(value || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function cleanExtractedFieldValue(value) {
+  return normalizeText(
+    String(value || "")
+      .replace(/^[\s:;،,.\-|]+/u, "")
+      .replace(/[\s|]+$/u, ""),
+    120,
+  );
+}
+
+function buildFieldValueRegex(aliases) {
+  const aliasPattern = aliases.map((alias) => escapeRegex(alias)).join("|");
+  return new RegExp(
+    `(?:${aliasPattern})\\s*(?:رقم\\s*)?(?::|：|#|-)?\\s*([^\\n\\r|]{1,100})`,
+    "iu",
+  );
+}
+
+function extractFieldValueFromText(text, aliases) {
+  const normalizedText = normalizeIndicDigits(text || "");
+  const directMatch = normalizedText.match(buildFieldValueRegex(aliases));
+  if (directMatch?.[1]) {
+    return cleanExtractedFieldValue(directMatch[1]);
+  }
+
+  const lines = normalizedText.split(/\r?\n/);
+  for (const line of lines) {
+    const normalizedLine = normalizeArabic(line);
+    const matchedAlias = aliases.find((alias) =>
+      normalizedLine.includes(normalizeArabic(alias)),
+    );
+    if (!matchedAlias) {
+      continue;
+    }
+
+    const fallbackMatch = line.match(buildFieldValueRegex([matchedAlias]));
+    if (fallbackMatch?.[1]) {
+      return cleanExtractedFieldValue(fallbackMatch[1]);
+    }
+
+    return cleanExtractedFieldValue(line);
+  }
+
+  return "";
+}
+
+const DATA_CONSISTENCY_FIELDS = [
+  {
+    field: "Plot Number",
+    aliases: [
+      "plot number",
+      "plot no",
+      "رقم القطعة",
+      "رقم قطعه",
+      "رقم الارض",
+      "رقم الأرض",
+      "رقم القسيمة",
+    ],
+    submissionFallbackKey: "plotNumber",
+  },
+  {
+    field: "Beneficiary Name",
+    aliases: [
+      "beneficiary name",
+      "owner name",
+      "applicant name",
+      "اسم المستفيد",
+      "اسم المالك",
+      "المالك",
+    ],
+    submissionFallbackKey: "applicantName",
+  },
+  {
+    field: "Engineering Office",
+    aliases: [
+      "engineering office",
+      "consultant office",
+      "office name",
+      "المكتب الهندسي",
+      "اسم المكتب",
+      "الاستشاري",
+    ],
+    submissionFallbackKey: "officeName",
+  },
+  {
+    field: "Plan Number",
+    aliases: [
+      "plan number",
+      "plan no",
+      "رقم المخطط",
+      "المخطط رقم",
+      "رقم المخطط التنظيمي",
+    ],
+  },
+  {
+    field: "Deed Number",
+    aliases: [
+      "deed number",
+      "deed no",
+      "sak number",
+      "رقم الصك",
+      "الصك رقم",
+      "رقم سند الملكية",
+    ],
+  },
+];
+
+function buildExpectedDataConsistencyFields(context) {
+  const workbookFields = Array.isArray(context.consistencyCheckItems)
+    ? context.consistencyCheckItems
+        .map((field) => normalizeText(field, 220))
+        .filter(Boolean)
+        .map((field) => ({
+          field,
+          aliases: [],
+          workbookDriven: true,
+        }))
+    : [];
+
+  return [
+    ...DATA_CONSISTENCY_FIELDS,
+    ...workbookFields.filter(
+      (fieldConfig) =>
+        !DATA_CONSISTENCY_FIELDS.some(
+          (baseField) =>
+            normalizeArabic(baseField.field) ===
+            normalizeArabic(fieldConfig.field),
+        ),
+    ),
+  ];
+}
+
+function findValueInAttachments(attachments, aliases) {
+  for (const attachment of attachments) {
+    const value = extractFieldValueFromText(attachment.extractedText, aliases);
+    if (value) {
+      return {
+        value,
+        sourceRef: attachment.name,
+      };
+    }
+  }
+
+  return null;
+}
+
+function buildDataConsistencyRowsFromAttachments(context) {
+  const attachments = Array.isArray(context.attachments)
+    ? context.attachments
+    : [];
+  const sakAttachments = attachments.filter((attachment) => {
+    const detectedDocuments = Array.isArray(attachment.detectedDocuments)
+      ? attachment.detectedDocuments
+      : [];
+    return (
+      attachment.requiredDocument === "صورة الصك" ||
+      detectedDocuments.includes("صورة الصك") ||
+      normalizeArabic(attachment.name).includes(normalizeArabic("صك"))
+    );
+  });
+  const nonSakAttachments = attachments.filter(
+    (attachment) => !sakAttachments.includes(attachment),
+  );
+
+  return buildExpectedDataConsistencyFields(context).map((fieldConfig) => {
+    if (
+      !Array.isArray(fieldConfig.aliases) ||
+      fieldConfig.aliases.length === 0
+    ) {
+      return {
+        field: fieldConfig.field,
+        sak: "Missing",
+        otherDocs: "Missing",
+        status: "Missing",
+        sourceRefs: [context.notesForCheckPath].filter(Boolean).slice(0, 4),
+      };
+    }
+
+    const sakMatch = findValueInAttachments(
+      sakAttachments,
+      fieldConfig.aliases,
+    );
+    const otherMatch = findValueInAttachments(
+      nonSakAttachments,
+      fieldConfig.aliases,
+    );
+    const submissionValue = fieldConfig.submissionFallbackKey
+      ? normalizeText(
+          context.submission?.[fieldConfig.submissionFallbackKey],
+          120,
+        )
+      : "";
+    const otherValue = otherMatch?.value || submissionValue || "Missing";
+    const sakValue = sakMatch?.value || "Missing";
+    const status =
+      sakValue === "Missing" || otherValue === "Missing"
+        ? "Missing"
+        : normalizeComparableValue(sakValue) ===
+            normalizeComparableValue(otherValue)
+          ? "Match"
+          : "Mismatch";
+
+    return {
+      field: fieldConfig.field,
+      sak: sakValue,
+      otherDocs: otherValue,
+      status,
+      sourceRefs: [sakMatch?.sourceRef, otherMatch?.sourceRef]
+        .filter(Boolean)
+        .slice(0, 4),
+    };
+  });
+}
+
+function buildAttachmentAccuracyFallback(context) {
+  const attachments = Array.isArray(context.attachments)
+    ? context.attachments
+    : [];
+  const requiredDocuments = Array.isArray(context.requiredDocuments)
+    ? context.requiredDocuments
+    : [];
+  const accuracyNotes = [];
+  const mislinkedAttachments = attachments.filter((attachment) => {
+    if (!attachment.requiredDocument) {
+      return false;
+    }
+
+    return !attachment.detectedDocuments.includes(attachment.requiredDocument);
+  });
+  const unrelatedAttachments = attachments.filter(
+    (attachment) =>
+      !attachment.requiredDocument &&
+      (!Array.isArray(attachment.detectedDocuments) ||
+        attachment.detectedDocuments.length === 0),
+  );
+  const offPolicyAttachments = attachments.filter(
+    (attachment) =>
+      Array.isArray(attachment.detectedDocuments) &&
+      attachment.detectedDocuments.some(
+        (documentName) => !requiredDocuments.includes(documentName),
+      ),
+  );
+
+  mislinkedAttachments.forEach((attachment) => {
+    accuracyNotes.push(
+      `الملف ${attachment.name} مرفوع تحت ${attachment.requiredDocument} لكن التحليل لم يؤكد مطابقته لهذا المتطلب.`,
+    );
+  });
+  unrelatedAttachments.forEach((attachment) => {
+    accuracyNotes.push(
+      `الملف ${attachment.name} لم يرتبط بمتطلب واضح وقد يكون غير ذي صلة أو غير مقروء بشكل كاف.`,
+    );
+  });
+  offPolicyAttachments.forEach((attachment) => {
+    accuracyNotes.push(
+      `الملف ${attachment.name} يحتوي على مؤشرات لمستندات خارج قائمة المتطلبات الحالية.`,
+    );
+  });
+
+  if (context.missingDocuments.length > 0) {
+    accuracyNotes.push(
+      `لا يمكن اعتبار الربط كاملاً لأن بعض المرفقات المطلوبة ما زالت ناقصة: ${context.missingDocuments.join("، ")}.`,
+    );
+  }
+
+  const hasAnyValidAttachment = attachments.some(
+    (attachment) =>
+      Array.isArray(attachment.detectedDocuments) &&
+      attachment.detectedDocuments.some((documentName) =>
+        requiredDocuments.includes(documentName),
+      ),
+  );
+
+  const status =
+    accuracyNotes.length === 0
+      ? "Valid"
+      : hasAnyValidAttachment
+        ? "Partially Valid"
+        : "Invalid";
+
+  return {
+    status,
+    notes:
+      accuracyNotes.length > 0
+        ? accuracyNotes.slice(0, 12)
+        : [
+            "المرفقات الحالية مرتبطة منطقياً بالصك ونوع المشروع والمتطلبات المطلوبة.",
+          ],
+  };
+}
+
+function buildChecklistEvidenceSources(context) {
+  const attachmentSources = (
+    Array.isArray(context.attachments) ? context.attachments : []
+  ).map((attachment) => ({
+    sourceRef:
+      normalizeText(attachment?.name, 220) ||
+      normalizeText(attachment?.requiredDocument, 220) ||
+      "ملف مرفوع",
+    text: normalizeText(
+      [
+        attachment?.name,
+        attachment?.requiredDocument,
+        ...(Array.isArray(attachment?.detectedDocuments)
+          ? attachment.detectedDocuments
+          : []),
+        ...(Array.isArray(attachment?.notes) ? attachment.notes : []),
+        attachment?.extractedText,
+      ]
+        .filter(Boolean)
+        .join("\n"),
+      12000,
+    ),
+  }));
+
+  const inlineSourceText = normalizeText(
+    [
+      context.fileName,
+      context.expectedDocument,
+      ...(Array.isArray(context.detectedDocuments)
+        ? context.detectedDocuments
+        : []),
+      ...(Array.isArray(context.notes) ? context.notes : []),
+      context.extractedText,
+    ]
+      .filter(Boolean)
+      .join("\n"),
+    12000,
+  );
+
+  if (inlineSourceText) {
+    attachmentSources.push({
+      sourceRef: normalizeText(context.fileName, 220) || "الملف الحالي",
+      text: inlineSourceText,
+    });
+  }
+
+  return attachmentSources.filter((source) => source.text);
+}
+
+function buildArchitecturalChecklistFallback(itemText, context) {
+  const normalizedItem = normalizeArabic(itemText);
+  const normalizedBuildingRatio = normalizeArabic("نسبة البناء");
+  const normalizedParking = normalizeArabic("مواقف السيارات");
+  const normalizedAccessibility = normalizeArabic("متطلبات ذوي الإعاقة");
+
+  let evidenceTerms = [];
+  let matchedComment = "";
+
+  if (normalizedItem === normalizedBuildingRatio) {
+    evidenceTerms = [
+      "نسبة البناء",
+      "نسبه البناء",
+      "جدول المساحات",
+      "جدول المساحه",
+      "مسطحات البناء",
+      "مساحات البناء",
+      "building ratio",
+      "coverage ratio",
+    ].map((term) => normalizeArabic(term));
+  } else if (normalizedItem === normalizedParking) {
+    evidenceTerms = [
+      "مواقف السيارات",
+      "مواقف",
+      "موقف سيارة",
+      "مواقف سيارات",
+      "parking",
+      "parking bay",
+      "parking bays",
+      "parking stall",
+      "parking stalls",
+      "car park",
+      "car parking",
+      "garage",
+      "موقف",
+      "مواقف مرسومة",
+      "صف مواقف",
+      "موقفين",
+      "ثلاث مواقف",
+      "مدخل سيارة",
+      "ramps",
+      "ramp",
+      "منحدر سيارات",
+      "كراج",
+    ].map((term) => normalizeArabic(term));
+  } else if (normalizedItem.includes(normalizedAccessibility)) {
+    evidenceTerms = [
+      "ذوي الإعاقة",
+      "ذوي الاعاقة",
+      "إعاقة",
+      "اعاقة",
+      "كرسي متحرك",
+      "wheelchair",
+      "accessible",
+      "accessibility",
+      "منحدر ذوي الإعاقة",
+      "منحدر ذوي الاعاقة",
+      "رامب ذوي الإعاقة",
+      "رامب ذوي الاعاقة",
+      "ramp accessible",
+      "accessible ramp",
+      "دورة مياه لذوي الإعاقة",
+      "دورة مياه لذوي الاعاقة",
+      "حمام ذوي الإعاقة",
+      "حمام ذوي الاعاقة",
+      "مصعد",
+      "elevator",
+      "lift",
+      "disabled parking",
+      "accessible parking",
+    ].map((term) => normalizeArabic(term));
+  } else {
+    return null;
+  }
+
+  const evidenceSources = buildChecklistEvidenceSources(context).filter(
+    (source) => {
+      const normalizedSourceText = normalizeArabic(source.text);
+      return evidenceTerms.some((term) => normalizedSourceText.includes(term));
+    },
+  );
+
+  if (evidenceSources.length === 0) {
+    return null;
+  }
+
+  const sourceRefs = Array.from(
+    new Set(evidenceSources.map((source) => source.sourceRef).filter(Boolean)),
+  ).slice(0, 4);
+  const areaScheduleEvidence = evidenceSources.some((source) =>
+    normalizeArabic(source.text).includes(normalizeArabic("جدول المساحات")),
+  );
+  const parkingLayoutEvidence = evidenceSources.some((source) => {
+    const normalizedSourceText = normalizeArabic(source.text);
+    return [
+      normalizeArabic("parking"),
+      normalizeArabic("parking bay"),
+      normalizeArabic("parking stall"),
+      normalizeArabic("مواقف"),
+      normalizeArabic("موقف سيارة"),
+      normalizeArabic("كراج"),
+      normalizeArabic("مدخل سيارة"),
+    ].some((term) => normalizedSourceText.includes(term));
+  });
+  const accessibilityEvidence = evidenceSources.some((source) => {
+    const normalizedSourceText = normalizeArabic(source.text);
+    return [
+      normalizeArabic("ذوي الإعاقة"),
+      normalizeArabic("ذوي الاعاقة"),
+      normalizeArabic("كرسي متحرك"),
+      normalizeArabic("wheelchair"),
+      normalizeArabic("accessible"),
+      normalizeArabic("منحدر ذوي الإعاقة"),
+      normalizeArabic("منحدر ذوي الاعاقة"),
+      normalizeArabic("دورة مياه لذوي الإعاقة"),
+      normalizeArabic("دورة مياه لذوي الاعاقة"),
+      normalizeArabic("accessible ramp"),
+      normalizeArabic("disabled parking"),
+      normalizeArabic("accessible parking"),
+    ].some((term) => normalizedSourceText.includes(term));
+  });
+
+  if (normalizedItem === normalizedBuildingRatio) {
+    matchedComment = areaScheduleEvidence
+      ? "تم رصد جدول المساحات ويُستخدم كمرجع مباشر للتحقق من نسبة البناء في الملف أو الملفات الحالية."
+      : "تم رصد مؤشر صريح على نسبة البناء داخل الملف أو الملفات الحالية.";
+  } else if (normalizedItem === normalizedParking) {
+    matchedComment = parkingLayoutEvidence
+      ? "تم رصد توزيع أو رموز مواقف سيارات داخل المخطط ويُعتمد ذلك كدليل على تحقق بند مواقف السيارات حتى لو لم يظهر العنوان نصاً."
+      : "تم رصد مؤشر صريح على مواقف السيارات داخل الملف أو الملفات الحالية.";
+  } else {
+    matchedComment = accessibilityEvidence
+      ? "تم رصد متطلبات واضحة لذوي الإعاقة داخل المخطط، لذلك يمكن ذكر هذا البند لأنه ظاهر في الملف الحالي."
+      : "تم رصد مؤشر صريح على متطلبات ذوي الإعاقة داخل الملف أو الملفات الحالية.";
+  }
+
+  return {
+    item: itemText,
+    status: "Compliant",
+    comment: matchedComment,
+    sourceRefs,
+  };
+}
+
+function requiresExplicitArchitecturalEvidence(itemText) {
+  return normalizeArabic(itemText).includes(
+    normalizeArabic("متطلبات ذوي الإعاقة"),
+  );
+}
+
+function buildChecklistRows(parsedRows, context) {
+  const rowsByItem = new Map();
+
+  (Array.isArray(parsedRows) ? parsedRows : []).forEach((row) => {
+    const itemText = normalizeText(row?.item, 220);
+    if (!itemText) {
+      return;
+    }
+
+    rowsByItem.set(normalizeArabic(itemText), {
+      item: itemText,
+      status:
+        row?.status === "Compliant" ||
+        row?.status === "Non-Compliant" ||
+        row?.status === "Not Found"
+          ? row.status
+          : "Not Found",
+      comment:
+        normalizeText(row?.comment, 320) ||
+        "لم يتم العثور على دليل صريح لهذا البند داخل الملفات الحالية.",
+      sourceRefs: normalizeStringList(row?.sourceRefs, 4),
+    });
+  });
+
+  return (
+    Array.isArray(context.notesForCheckItems) ? context.notesForCheckItems : []
+  ).map((itemText) => {
+    const matched = rowsByItem.get(normalizeArabic(itemText));
+    const fallback = buildArchitecturalChecklistFallback(itemText, context);
+    const requiresExplicitEvidence =
+      requiresExplicitArchitecturalEvidence(itemText);
+
+    if (matched && matched.status !== "Not Found") {
+      if (requiresExplicitEvidence && !fallback) {
+        return {
+          item: itemText,
+          status: "Not Found",
+          comment: "لا يتم ذكر هذا البند إلا إذا ظهر صراحة داخل الملف الحالي.",
+          sourceRefs: [context.notesForCheckPath].filter(Boolean),
+        };
+      }
+
+      if (
+        fallback &&
+        (!Array.isArray(matched.sourceRefs) || matched.sourceRefs.length === 0)
+      ) {
+        return {
+          ...matched,
+          sourceRefs: fallback.sourceRefs,
+        };
+      }
+
+      return matched;
+    }
+
+    if (fallback) {
+      return fallback;
+    }
+
+    return (
+      matched || {
+        item: itemText,
+        status: "Not Found",
+        comment: "لم يتم العثور على دليل صريح لهذا البند داخل الملفات الحالية.",
+        sourceRefs: [context.notesForCheckPath].filter(Boolean),
+      }
+    );
+  });
+}
+
+function buildRequirementsComplianceStatus(checklistRows, context) {
+  const hasArchitecturalAttachment = (
+    Array.isArray(context.attachments) ? context.attachments : []
+  ).some(
+    (attachment) =>
+      Array.isArray(attachment.detectedDocuments) &&
+      attachment.detectedDocuments.includes("المخططات المعمارية"),
+  );
+
+  if (!hasArchitecturalAttachment) {
+    return "Not Compliant";
+  }
+
+  return checklistRows.every((row) => row.status === "Compliant")
+    ? "Compliant"
+    : "Not Compliant";
+}
+
+function buildFinalSummaryFallback(context, derivedReport) {
+  const derivedMissingDocuments = derivedReport.attachmentsStatus.rows
+    .filter((row) => row.status === "Missing")
+    .map((row) => row.attachment);
+  const missingDocumentsText =
+    derivedMissingDocuments.length > 0
+      ? `مفقود (${derivedMissingDocuments.join("، ")})`
+      : "مكتمل";
+  const dataConsistencyState = derivedReport.dataConsistencyCheck.every(
+    (row) => row.status === "Match",
+  )
+    ? "متطابق"
+    : derivedReport.dataConsistencyCheck.some(
+          (row) => row.status === "Mismatch",
+        )
+      ? "غير متطابق"
+      : "مفقود";
+
+  return {
+    attachments: missingDocumentsText,
+    dataConsistency: dataConsistencyState,
+    architecturalCompliance:
+      derivedReport.architecturalCompliance.requirementsCompliance ===
+      "Compliant"
+        ? "متوافق"
+        : "غير متوافق",
+    keyIssues: Array.from(
+      new Set([
+        ...context.missingDocuments.map(
+          (documentName) => `${documentName}: هذا المرفق مفقود ويجب استكماله.`,
+        ),
+        ...derivedMissingDocuments.map(
+          (documentName) => `${documentName}: هذا المرفق مفقود ويجب استكماله.`,
+        ),
+        ...derivedReport.attachmentAccuracy.notes,
+        ...derivedReport.architecturalCompliance.violations,
+      ]),
+    ).slice(0, 12),
+  };
+}
+
+function normalizeComplianceReport(parsedReport, context) {
+  const report =
+    parsedReport && typeof parsedReport === "object" ? parsedReport : {};
+  const fallbackProjectType =
+    context.projectSubtypeTitle || context.projectTypeGroupTitle || "غير محدد";
+
+  const attachmentRows = Array.isArray(report.attachmentsStatus?.rows)
+    ? report.attachmentsStatus.rows
+    : [];
+  const attachmentDocumentSet = new Set(
+    (Array.isArray(context.attachments) ? context.attachments : []).flatMap(
+      (attachment) => {
+        const detected = Array.isArray(attachment.detectedDocuments)
+          ? attachment.detectedDocuments
+          : [];
+        return attachment.requiredDocument
+          ? [...detected, attachment.requiredDocument]
+          : detected;
+      },
+    ),
+  );
+  const normalizedAttachmentRows = context.requiredDocuments.map(
+    (documentName) => {
+      const matchedRow = attachmentRows.find(
+        (row) =>
+          row &&
+          typeof row.attachment === "string" &&
+          normalizeArabic(row.attachment) === normalizeArabic(documentName),
+      );
+      const ruleMatched = context.matchedDocuments.includes(documentName);
+      const ruleMissing =
+        context.missingDocuments.includes(documentName) ||
+        (!ruleMatched && !attachmentDocumentSet.has(documentName));
+
+      return {
+        attachment: documentName,
+        status: normalizeValueFromSet(
+          matchedRow?.status,
+          ["Present", "Missing", "Invalid / Unclear"],
+          ruleMatched
+            ? "Present"
+            : ruleMissing
+              ? "Missing"
+              : "Invalid / Unclear",
+        ),
+        notes:
+          normalizeText(matchedRow?.notes, 320) ||
+          (ruleMissing
+            ? "هذا المرفق مفقود ويجب استكماله."
+            : ruleMatched
+              ? "تم رصد هذا المرفق ضمن الملفات المرفوعة."
+              : "تعذر التحقق من هذا المرفق بوضوح من الملفات المرفوعة."),
+        sourceRefs: normalizeStringList(matchedRow?.sourceRefs, 4),
+      };
+    },
+  );
+
+  const normalizedConsistencyRows = buildExpectedDataConsistencyFields(
+    context,
+  ).map((fieldConfig) => {
+    const matchedRow = Array.isArray(report.dataConsistencyCheck)
+      ? report.dataConsistencyCheck.find(
+          (row) =>
+            row &&
+            typeof row.field === "string" &&
+            normalizeArabic(row.field) === normalizeArabic(fieldConfig.field),
+        )
+      : null;
+    const fallbackRow = buildDataConsistencyRowsFromAttachments(context).find(
+      (row) =>
+        normalizeArabic(row.field) === normalizeArabic(fieldConfig.field),
+    );
+
+    return {
+      field: fieldConfig.field,
+      sak: normalizeText(matchedRow?.sak, 160) || fallbackRow?.sak || "مفقود",
+      otherDocs:
+        normalizeText(matchedRow?.otherDocs, 160) ||
+        fallbackRow?.otherDocs ||
+        "مفقود",
+      status: normalizeValueFromSet(
+        matchedRow?.status,
+        ["Match", "Mismatch", "Missing"],
+        fallbackRow?.status || "Missing",
+      ),
+      sourceRefs:
+        normalizeStringList(matchedRow?.sourceRefs, 4).length > 0
+          ? normalizeStringList(matchedRow?.sourceRefs, 4)
+          : fallbackRow?.sourceRefs || [],
+    };
+  });
+
+  const normalizedChecklistRows = buildChecklistRows(
+    report.architecturalCompliance?.notesForCheck,
+    context,
+  );
+
+  const attachmentAccuracyFallback = buildAttachmentAccuracyFallback(context);
+  const normalizedAttachmentAccuracy = {
+    status: normalizeValueFromSet(
+      report.attachmentAccuracy?.status,
+      ["Valid", "Invalid", "Partially Valid"],
+      attachmentAccuracyFallback.status,
+    ),
+    notes: (() => {
+      const parsedNotes = normalizeStringList(
+        report.attachmentAccuracy?.notes,
+        12,
+      );
+      return parsedNotes.length > 0
+        ? parsedNotes
+        : attachmentAccuracyFallback.notes;
+    })(),
+  };
+
+  const normalizedArchitecturalCompliance = {
+    requirementsCompliance: normalizeValueFromSet(
+      report.architecturalCompliance?.requirementsCompliance,
+      ["Compliant", "Not Compliant"],
+      buildRequirementsComplianceStatus(normalizedChecklistRows, context),
+    ),
+    notesForCheck: normalizedChecklistRows,
+    violations: (() => {
+      const parsedViolations = normalizeStringList(
+        report.architecturalCompliance?.violations,
+        24,
+      );
+      if (parsedViolations.length > 0) {
+        return parsedViolations;
+      }
+
+      const derivedViolations = normalizedChecklistRows
+        .filter((row) => row.status !== "Compliant")
+        .map(
+          (row) =>
+            `${row.item}: ${row.comment || "البند غير مطابق أو غير موجود بوضوح في الملفات الحالية."}`,
+        );
+
+      return derivedViolations.slice(0, 24);
+    })(),
+  };
+
+  const overallStatus = normalizedAttachmentRows.every(
+    (row) => row.status === "Present",
+  )
+    ? "مكتمل"
+    : "غير مكتمل";
+
+  const derivedReport = {
+    projectInformation: {
+      projectType:
+        normalizeText(report.projectInformation?.projectType, 120) ||
+        fallbackProjectType,
+      confidenceLevel: normalizeConfidenceLevel(
+        report.projectInformation?.confidenceLevel,
+        context.confidence,
+      ),
+    },
+    attachmentsStatus: {
+      overallStatus: normalizeValueFromSet(
+        report.attachmentsStatus?.overallStatus,
+        ["Complete", "Incomplete"],
+        overallStatus,
+      ),
+      rows: normalizedAttachmentRows,
+    },
+    dataConsistencyCheck: normalizedConsistencyRows,
+    attachmentAccuracy: normalizedAttachmentAccuracy,
+    architecturalCompliance: normalizedArchitecturalCompliance,
+  };
+
+  const finalSummaryFallback = buildFinalSummaryFallback(
+    context,
+    derivedReport,
+  );
+
+  return {
+    ...derivedReport,
+    finalSummary: {
+      attachments:
+        normalizeText(report.finalSummary?.attachments, 220) ||
+        finalSummaryFallback.attachments,
+      dataConsistency:
+        normalizeText(report.finalSummary?.dataConsistency, 220) ||
+        finalSummaryFallback.dataConsistency,
+      architecturalCompliance:
+        normalizeText(report.finalSummary?.architecturalCompliance, 220) ||
+        finalSummaryFallback.architecturalCompliance,
+      keyIssues: (() => {
+        const parsedIssues = normalizeStringList(
+          report.finalSummary?.keyIssues,
+          12,
+        );
+        return parsedIssues.length > 0
+          ? parsedIssues
+          : finalSummaryFallback.keyIssues;
+      })(),
+    },
+  };
 }
 
 function mapDetectedDocumentsToPolicy(value, requiredDocuments) {
@@ -585,31 +2194,280 @@ function deriveConfidence(parsedConfidence, submission, ruleReview) {
   return Math.min(baseConfidence, confidenceCeiling);
 }
 
-async function requestStructuredJson({ client, model, messages }) {
-  const completion = await client.chat.completions.create({
-    model,
-    response_format: { type: "json_object" },
-    temperature: 0.2,
-    messages,
-  });
+async function requestStructuredJson({
+  client,
+  model,
+  messages,
+  fallbackModels = [],
+}) {
+  const candidateModels = collectCandidateModels(model, fallbackModels);
+  let lastError;
+  const blockedModels = new Set();
 
-  return {
-    model,
-    parsed: parseModelJson(completion.choices[0]?.message?.content || "{}"),
-  };
+  const startedAt = Date.now();
+  let attemptCount = 0;
+
+  while (attemptCount < MAX_RATE_LIMIT_TOTAL_ATTEMPTS) {
+    const candidateModel = selectCandidateModel(candidateModels, blockedModels);
+    if (!candidateModel) {
+      break;
+    }
+
+    const remainingWaitBudgetMs =
+      MAX_RATE_LIMIT_TOTAL_WAIT_MS - (Date.now() - startedAt);
+    if (remainingWaitBudgetMs <= 0) {
+      break;
+    }
+
+    const waitForModelMs = getModelWaitTime(candidateModel);
+    if (waitForModelMs > 0) {
+      await wait(Math.min(waitForModelMs, remainingWaitBudgetMs));
+      if (Date.now() - startedAt >= MAX_RATE_LIMIT_TOTAL_WAIT_MS) {
+        break;
+      }
+    }
+
+    attemptCount += 1;
+
+    try {
+      const completion = await client.chat.completions.create({
+        model: candidateModel,
+        response_format: { type: "json_object" },
+        temperature: 0.2,
+        messages,
+      });
+
+      clearModelRateLimit(candidateModel);
+
+      return {
+        model: candidateModel,
+        parsed: parseModelJson(completion.choices[0]?.message?.content || "{}"),
+      };
+    } catch (error) {
+      lastError = error;
+      if (shouldSkipModelAfterError(error)) {
+        blockedModels.add(candidateModel);
+        continue;
+      }
+
+      if (!isRateLimitError(error)) {
+        throw error;
+      }
+
+      const retryDelayMs = getRateLimitRetryDelayMs(error, attemptCount - 1);
+      markModelRateLimited(candidateModel, retryDelayMs);
+    }
+  }
+
+  if (isRateLimitError(lastError)) {
+    throw new Error(
+      buildRateLimitExhaustedMessage(candidateModels, startedAt, lastError),
+    );
+  }
+
+  throw lastError;
 }
 
-export function createReviewApp({
-  knowledgeBase = loadKnowledgeBase(projectRoot),
-  client = buildClient(process.env.OPENAI_API_KEY),
-  reviewModel = process.env.OPENAI_UI_REVIEW_MODEL ||
-    process.env.OPENAI_MODEL ||
-    DEFAULT_REVIEW_MODEL,
-  extractionModel = process.env.OPENAI_UI_EXTRACTION_MODEL ||
-    process.env.OPENAI_MODEL ||
-    DEFAULT_EXTRACTION_MODEL,
-  fallbackModel = process.env.OPENAI_FALLBACK_MODEL || "",
-} = {}) {
+function collectCandidateModels(primaryModel, fallbackModels = []) {
+  const values = [primaryModel, ...splitModelList(fallbackModels)];
+  return Array.from(
+    new Set(values.map((value) => String(value || "").trim()).filter(Boolean)),
+  );
+}
+
+function buildAutomaticFallbackModels(primaryModel, additionalModels = []) {
+  const normalizedPrimaryModel = String(primaryModel || "").trim();
+  const familyFallbacks = [];
+
+  if (/gpt-4o-mini/i.test(normalizedPrimaryModel)) {
+    familyFallbacks.push("gpt-4.1-mini", "gpt-4.1-nano");
+  } else if (/gpt-4\.1-mini/i.test(normalizedPrimaryModel)) {
+    familyFallbacks.push("gpt-4o-mini", "gpt-4.1-nano");
+  } else if (/gpt-4\.1/i.test(normalizedPrimaryModel)) {
+    familyFallbacks.push("gpt-4.1-mini", "gpt-4o-mini", "gpt-4.1-nano");
+  } else {
+    familyFallbacks.push(...DEFAULT_CROSS_MODEL_FALLBACKS, "gpt-4o-mini");
+  }
+
+  return collectCandidateModels(
+    "",
+    [...familyFallbacks, ...splitModelList(additionalModels)].filter(
+      (modelName) => modelName && modelName !== normalizedPrimaryModel,
+    ),
+  );
+}
+
+function splitModelList(value) {
+  if (Array.isArray(value)) {
+    return value.flatMap((item) => splitModelList(item));
+  }
+
+  return String(value || "")
+    .split(",")
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+function getModelWaitTime(modelName) {
+  const nextAvailableAt = Number(
+    modelRateLimitAvailability.get(modelName) || 0,
+  );
+  if (!Number.isFinite(nextAvailableAt) || nextAvailableAt <= Date.now()) {
+    return 0;
+  }
+
+  return nextAvailableAt - Date.now();
+}
+
+function selectCandidateModel(candidateModels, blockedModels = new Set()) {
+  return [...candidateModels]
+    .filter((modelName) => !blockedModels.has(modelName))
+    .sort((left, right) => getModelWaitTime(left) - getModelWaitTime(right))[0];
+}
+
+function shouldSkipModelAfterError(error) {
+  const status = Number(error?.status);
+  const message = String(error?.message || "");
+
+  if (status === 404) {
+    return true;
+  }
+
+  if (status === 400 || status === 403) {
+    return /model|not found|does not exist|unsupported|access|permission/i.test(
+      message,
+    );
+  }
+
+  return false;
+}
+
+function markModelRateLimited(modelName, delayMs) {
+  modelRateLimitAvailability.set(
+    modelName,
+    Date.now() + Math.max(DEFAULT_RATE_LIMIT_RETRY_DELAY_MS, delayMs),
+  );
+}
+
+function clearModelRateLimit(modelName) {
+  modelRateLimitAvailability.delete(modelName);
+}
+
+function buildRateLimitExhaustedMessage(candidateModels, startedAt, lastError) {
+  const elapsedSeconds = Math.max(
+    1,
+    Math.round((Date.now() - startedAt) / 1000),
+  );
+  const originalMessage =
+    lastError instanceof Error && lastError.message
+      ? ` آخر رسالة: ${lastError.message}`
+      : "";
+
+  return `استمر الخادم بمحاولة التنفيذ على نماذج الذكاء الاصطناعي (${candidateModels.join("، ")}) لمدة ${elapsedSeconds} ثانية لكنه بقي ضمن حد المعدل.${originalMessage}`;
+}
+
+function isRateLimitError(error) {
+  return (
+    Number(error?.status) === 429 ||
+    /rate limit/i.test(String(error?.message || ""))
+  );
+}
+
+function getRateLimitRetryDelayMs(error, attemptIndex = 0) {
+  const retryAfterHeader = Number(
+    error?.headers?.["retry-after-ms"] || error?.headers?.["retry-after"] || 0,
+  );
+  if (Number.isFinite(retryAfterHeader) && retryAfterHeader > 0) {
+    return Math.ceil(retryAfterHeader) + RATE_LIMIT_RETRY_PADDING_MS;
+  }
+
+  const message = String(error?.message || "");
+  const millisecondsMatch = message.match(/try again in\s+(\d+)ms/i);
+  if (millisecondsMatch) {
+    return Number(millisecondsMatch[1]) + RATE_LIMIT_RETRY_PADDING_MS;
+  }
+
+  const secondsMatch = message.match(/try again in\s+(\d+(?:\.\d+)?)s/i);
+  if (secondsMatch) {
+    return (
+      Math.ceil(Number(secondsMatch[1]) * 1000) + RATE_LIMIT_RETRY_PADDING_MS
+    );
+  }
+
+  return DEFAULT_RATE_LIMIT_RETRY_DELAY_MS * (attemptIndex + 1);
+}
+
+function wait(delayMs) {
+  return new Promise((resolve) => {
+    setTimeout(resolve, Math.max(0, delayMs));
+  });
+}
+
+export function createReviewApp(options = {}) {
+  loadEnvironment(projectRoot);
+
+  const {
+    knowledgeBase = loadKnowledgeBase(projectRoot),
+    notesForCheckContext = loadNotesForCheckContext(),
+    client = buildClient(process.env.OPENAI_API_KEY),
+    reviewModel = process.env.OPENAI_UI_REVIEW_MODEL ||
+      process.env.OPENAI_MODEL ||
+      DEFAULT_REVIEW_MODEL,
+    extractionModel = process.env.OPENAI_UI_EXTRACTION_MODEL ||
+      process.env.OPENAI_MODEL ||
+      DEFAULT_EXTRACTION_MODEL,
+    cadClassifierModel = process.env.OPENAI_UI_CAD_CLASSIFIER_MODEL ||
+      process.env.OPENAI_UI_EXTRACTION_MODEL ||
+      DEFAULT_CAD_CLASSIFIER_MODEL,
+    cadCriticalModel = process.env.OPENAI_UI_CAD_CRITICAL_MODEL ||
+      process.env.OPENAI_UI_REVIEW_MODEL ||
+      reviewModel,
+    fallbackModel = process.env.OPENAI_UI_FALLBACK_MODEL ||
+      process.env.OPENAI_FALLBACK_MODEL ||
+      process.env.OPENAI_UI_EXTRACTION_MODEL ||
+      process.env.OPENAI_UI_REVIEW_MODEL ||
+      DEFAULT_EXTRACTION_MODEL,
+    fallbackModels: configuredFallbackModels = options.fallbackModels ||
+      process.env.OPENAI_UI_FALLBACK_MODELS ||
+      [],
+  } = options;
+
+  const fallbackModels = collectCandidateModels(
+    "",
+    splitModelList(configuredFallbackModels).length > 0
+      ? configuredFallbackModels
+      : fallbackModel &&
+          ![
+            reviewModel,
+            extractionModel,
+            cadClassifierModel,
+            cadCriticalModel,
+          ].includes(fallbackModel)
+        ? [fallbackModel]
+        : buildAutomaticFallbackModels(reviewModel, [
+            fallbackModel,
+            extractionModel,
+            cadClassifierModel,
+            cadCriticalModel,
+          ]),
+  );
+
+  const modelAssignments = {
+    reviewModel,
+    extractionModel,
+    cadClassifierModel,
+    cadCriticalModel,
+    fallbackModels,
+  };
+
+  validateModelAssignments({
+    reviewModel,
+    extractionModel,
+    cadClassifierModel,
+    cadCriticalModel,
+    fallbackModels,
+  });
+
   const app = express();
   const allowedOrigins = getAllowedOrigins();
 
@@ -693,6 +2551,144 @@ export function createReviewApp({
     }
   });
 
+  app.post("/api/classify-cad-pages", async (req, res) => {
+    if (!client) {
+      return res.status(503).json({
+        error:
+          "OPENAI_API_KEY is not configured for the standalone review server.",
+      });
+    }
+
+    const {
+      fileName,
+      mimeType,
+      requiredDocuments,
+      pageImages,
+      localPageTexts,
+    } = req.body ?? {};
+    if (
+      !fileName ||
+      !Array.isArray(requiredDocuments) ||
+      requiredDocuments.length === 0 ||
+      !Array.isArray(pageImages) ||
+      pageImages.length === 0
+    ) {
+      return res.status(400).json({
+        error:
+          "Missing fileName, requiredDocuments, or pageImages payload for CAD classification.",
+      });
+    }
+
+    const sanitizedImages = pageImages
+      .map((pageImage) => ({
+        pageNumber: Number(pageImage?.pageNumber),
+        dataUrl:
+          typeof pageImage?.dataUrl === "string" ? pageImage.dataUrl : "",
+      }))
+      .filter(
+        (pageImage) =>
+          Number.isFinite(pageImage.pageNumber) &&
+          /^data:image\/(png|jpeg|jpg|webp);base64,/i.test(pageImage.dataUrl),
+      )
+      .slice(0, 16);
+
+    const normalizedRequiredDocuments = normalizeStringList(
+      requiredDocuments,
+      40,
+    );
+    const pageTextsByNumber = new Map(
+      (Array.isArray(localPageTexts) ? localPageTexts : [])
+        .map((item) => ({
+          pageNumber: Number(item?.pageNumber),
+          text: normalizeText(item?.text, 900),
+        }))
+        .filter((item) => Number.isFinite(item.pageNumber)),
+    );
+
+    const systemPrompt = [
+      "You classify CAD and engineering drawing pages for Riyadh Municipality using the cheapest possible first-pass vision review.",
+      "Respond only with valid JSON.",
+      "Your job is page triage, not final compliance review.",
+      "For each page, return critical only if it is likely to contain a title block, discipline label, checklist-relevant sheet, site plan, structural plan, architectural plan, electrical plan, mechanical plan, safety plan, or official project/deed sheet.",
+      "Return supporting for pages that may help context but are less central.",
+      "Return ignore for decorative, repeated, blank, or low-signal pages.",
+      "Be conservative and optimize for reducing downstream cost without dropping obviously important pages.",
+      "Write all user-facing strings in Arabic.",
+    ].join(" ");
+
+    const userPayload = {
+      instruction:
+        "صنف الصفحات إلى critical أو supporting أو ignore بهدف اختيار أقل عدد ممكن من الصفحات التي تستحق التحليل الأقوى لاحقاً. ركز على الصفحات التي يظهر فيها عنوان لوحة، تخصص هندسي، بيانات مشروع، بيانات مالك، أو أي دلالة قوية على مستند مطلوب.",
+      outputSchema: {
+        pages:
+          "Array<{pageNumber:number, relevance:critical|supporting|ignore, reason:string, detectedDocuments:string[]}>",
+      },
+      file: {
+        fileName,
+        mimeType: typeof mimeType === "string" ? mimeType : "",
+        requiredDocuments: normalizedRequiredDocuments,
+        detectionHints: buildDetectionHints(normalizedRequiredDocuments),
+      },
+      pages: sanitizedImages.map(({ pageNumber }) => ({
+        pageNumber,
+        localText: pageTextsByNumber.get(pageNumber) || "",
+      })),
+    };
+
+    const messages = [
+      { role: "system", content: systemPrompt },
+      {
+        role: "user",
+        content: [
+          { type: "text", text: JSON.stringify(userPayload) },
+          ...sanitizedImages.flatMap(({ pageNumber, dataUrl }) => [
+            { type: "text", text: `الصفحة ${pageNumber}` },
+            { type: "image_url", image_url: { url: dataUrl, detail: "low" } },
+          ]),
+        ],
+      },
+    ];
+
+    try {
+      const completion = await requestStructuredJson({
+        client,
+        ...buildTaskModelPlan("cadPageClassification", modelAssignments),
+        messages,
+      });
+
+      const { model, parsed } = completion;
+      return res.json({
+        model,
+        pages: Array.isArray(parsed.pages)
+          ? parsed.pages
+              .map((item) => ({
+                pageNumber: Number(item?.pageNumber),
+                relevance: normalizeCadPageRelevance(item?.relevance),
+                reason: normalizeText(item?.reason, 180),
+                detectedDocuments: mapDetectedDocumentsToPolicy(
+                  item?.detectedDocuments,
+                  normalizedRequiredDocuments,
+                ),
+              }))
+              .filter((item) => Number.isFinite(item.pageNumber))
+          : [],
+      });
+    } catch (error) {
+      const message =
+        error instanceof Error
+          ? error.message
+          : "CAD page classification failed";
+      console.error("classify-cad-pages failed", {
+        taskModelPlan: buildTaskModelPlan(
+          "cadPageClassification",
+          modelAssignments,
+        ),
+        message,
+      });
+      return res.status(500).json({ error: message });
+    }
+  });
+
   app.post("/api/extract-attachment", async (req, res) => {
     if (!client) {
       return res.status(503).json({
@@ -706,6 +2702,7 @@ export function createReviewApp({
       mimeType,
       localExtractedText,
       requiredDocuments,
+      extractionMode,
       pageImages,
     } = req.body ?? {};
     if (
@@ -746,6 +2743,8 @@ export function createReviewApp({
       "Be conservative and do not claim a required document is present unless the page image or visible labels support it.",
       "Write all user-facing strings in Arabic.",
       "Keep extractedText concise and focused on document names, headings, stamps, and visible sheet titles.",
+      "If architectural-plan pages visually show parking bays, car slots, garage areas, ramps, or a parking layout, mention that evidence in extractedText or notes even when the sheet does not explicitly say parking.",
+      "Mention accessibility requirements only when they are clearly shown in the plan, such as wheelchair routes, accessible ramps, accessible toilets, accessibility labels, or dedicated disabled parking. Do not infer them from generic circulation unless the evidence is explicit.",
       "Pay special attention to sheet title blocks and repeated discipline labels such as electrical, structural, mechanical, site plan, safety, and approved building regulation sheets.",
     ].join(" ");
 
@@ -756,7 +2755,7 @@ export function createReviewApp({
 
     const userPayload = {
       instruction:
-        "استخرج النصوص والعناوين الظاهرة التي تساعد على التعرف على نوع المستندات داخل الملف الهندسي. راجع كل صفحة مرفقة بصرياً، وركز على خانة عنوان اللوحة، اسم التخصص، الأختام، ورؤوس الجداول. ثم حدد المستندات المطلوبة التي تظهر بوضوح أو بدلالة قوية في الصفحات. إذا ظهر عنوان قريب من اسم المستند المطلوب فارجعه باسم المستند المطلوب نفسه.",
+        "استخرج النصوص والعناوين الظاهرة التي تساعد على التعرف على نوع المستندات داخل الملف الهندسي. راجع كل صفحة مرفقة بصرياً، وركز على خانة عنوان اللوحة، اسم التخصص، الأختام، ورؤوس الجداول. ثم حدد المستندات المطلوبة التي تظهر بوضوح أو بدلالة قوية في الصفحات. إذا ظهر عنوان قريب من اسم المستند المطلوب فارجعه باسم المستند المطلوب نفسه. وإذا أظهرت اللوحة المعمارية مواقف سيارات مرسومة بصرياً أو صفوف مواقف أو كراج أو منحدر سيارات حتى دون عنوان نصي واضح، فاذكر ذلك صراحة داخل extractedText أو notes لأنه دليل مهم لبند مواقف السيارات. أما متطلبات ذوي الإعاقة (إن وجد) فلا تذكرها إلا إذا ظهرت بوضوح مثل منحدر مخصص أو مسار كرسي متحرك أو دورة مياه مخصصة أو وسم صريح لذلك داخل المخطط.",
       outputSchema: {
         extractedText: "string",
         detectedDocuments: "string[] subset of requiredDocuments",
@@ -787,25 +2786,19 @@ export function createReviewApp({
       },
     ];
 
-    try {
-      let completion;
-      try {
-        completion = await requestStructuredJson({
-          client,
-          model: extractionModel,
-          messages,
-        });
-      } catch (primaryError) {
-        if (!fallbackModel || fallbackModel === extractionModel) {
-          throw primaryError;
-        }
+    const taskModelPlan = buildTaskModelPlan(
+      extractionMode === "cad-critical"
+        ? "attachmentExtractionCadCritical"
+        : "attachmentExtractionStandard",
+      modelAssignments,
+    );
 
-        completion = await requestStructuredJson({
-          client,
-          model: fallbackModel,
-          messages,
-        });
-      }
+    try {
+      const completion = await requestStructuredJson({
+        client,
+        ...taskModelPlan,
+        messages,
+      });
 
       const { model, parsed } = completion;
       return res.json({
@@ -822,8 +2815,168 @@ export function createReviewApp({
       const message =
         error instanceof Error ? error.message : "Attachment extraction failed";
       console.error("extract-attachment failed", {
-        extractionModel,
-        fallbackModel,
+        taskModelPlan,
+        message,
+      });
+      return res.status(500).json({ error: message });
+    }
+  });
+
+  app.post("/api/validate-attachment", async (req, res) => {
+    if (!client) {
+      return res.status(503).json({
+        error:
+          "OPENAI_API_KEY is not configured for the standalone review server.",
+      });
+    }
+
+    const {
+      fileName,
+      mimeType,
+      sourceType,
+      requiredDocuments,
+      expectedDocument,
+      extractedText,
+      detectedDocuments,
+      notes,
+    } = req.body ?? {};
+
+    if (
+      !fileName ||
+      !Array.isArray(requiredDocuments) ||
+      requiredDocuments.length === 0
+    ) {
+      return res.status(400).json({
+        error: "Missing fileName or requiredDocuments payload.",
+      });
+    }
+
+    const normalizedRequiredDocuments = normalizeStringList(
+      requiredDocuments,
+      40,
+    );
+    const normalizedExpectedDocument = normalizeText(expectedDocument, 160);
+    const normalizedDetectedDocuments = mapDetectedDocumentsToPolicy(
+      detectedDocuments,
+      normalizedRequiredDocuments,
+    );
+    const normalizedNotes = normalizeStringList(notes, 8);
+    const structuredNotesForCheck = partitionNotesForCheckItems(
+      notesForCheckContext.checklistItems,
+    );
+    const architecturalChecklistItems =
+      structuredNotesForCheck.architecturalItems;
+    const isArchitecturalPlansValidation =
+      isArchitecturalPlansDocumentCandidate(normalizedExpectedDocument) ||
+      normalizedRequiredDocuments.some((documentName) =>
+        isArchitecturalPlansDocumentCandidate(documentName),
+      ) ||
+      normalizedDetectedDocuments.some((documentName) =>
+        isArchitecturalPlansDocumentCandidate(documentName),
+      );
+
+    const systemPrompt = [
+      "You validate one uploaded engineering permit attachment for Riyadh Municipality.",
+      "Respond only with valid JSON.",
+      "Your task is to judge whether this single file matches the expected required attachment and give direct feedback for that file.",
+      "Use only these statuses: passed, warning, missing.",
+      "passed means the file clearly matches the expected attachment.",
+      "warning means the file may be relevant but still has ambiguity, weak evidence, or quality issues.",
+      "missing means the file does not appear to match the expected attachment or has no usable evidence.",
+      "If the expected attachment is the architectural plans sheet, evaluate every checklist point provided in the payload and return one result row for each exact item text.",
+      "For the parking checklist item, accept parking evidence reflected in extractedText or notes even if the sheet title does not explicitly mention parking, especially when the source describes drawn parking bays, garage areas, ramps, or visual parking layout.",
+      "For the accessibility checklist item, mention it only when there is explicit evidence in the extractedText or notes, such as wheelchair paths, accessibility labels, accessible toilets, accessible ramps, or dedicated disabled parking. If it is not clearly shown, leave it as Not Found.",
+      "Be strict and concise. Do not guess.",
+      "Write all user-facing strings in Arabic.",
+    ].join(" ");
+
+    const userPayload = {
+      instruction: isArchitecturalPlansValidation
+        ? "قيّم هذا الملف الواحد فقط. هل يطابق المتطلب المطلوب؟ ثم افحص جميع بنود checklist الخاصة بالمخططات المعمارية الواردة في الحمولة وأخرج status وsummary وfeedback مع checklistResults بحيث يحتوي كل بند على item وstatus وcomment بشكل مباشر وقابل للعرض تحت خانة الرفع. في بند مواقف السيارات اعتبر الوصف الذي يذكر مواقف مرسومة أو صفوف مواقف أو كراج أو منحدر سيارات دليلاً صالحاً حتى لو لم يظهر اسم البند نصاً داخل اللوحة. أما بند متطلبات ذوي الإعاقة (إن وجد) فلا تذكره إلا إذا ظهر صراحة في النص أو الملاحظات المستخرجة مثل منحدر مخصص أو مسار كرسي متحرك أو دورة مياه مخصصة أو وسم واضح لذلك."
+        : "قيّم هذا الملف الواحد فقط. هل يطابق المتطلب المطلوب؟ أخرج status وsummary وfeedback بشكل مباشر وقابل للعرض تحت خانة الرفع.",
+      outputSchema: {
+        status: "passed | warning | missing",
+        summary: "string",
+        feedback: "string[]",
+        confidence: "number 0-100",
+        ...(isArchitecturalPlansValidation
+          ? {
+              checklistResults:
+                "Array<{item:string, status:Compliant|Non-Compliant|Not Found, comment:string}>",
+            }
+          : {}),
+      },
+      file: {
+        fileName,
+        mimeType: typeof mimeType === "string" ? mimeType : "",
+        sourceType: typeof sourceType === "string" ? sourceType : "",
+        expectedDocument: normalizedExpectedDocument,
+        requiredDocuments: normalizedRequiredDocuments,
+        detectedDocuments: normalizedDetectedDocuments,
+        notes: normalizedNotes,
+        extractedText: normalizeText(extractedText, 6000),
+      },
+      architecturalChecklistItems: isArchitecturalPlansValidation
+        ? architecturalChecklistItems
+        : [],
+    };
+
+    const messages = [
+      { role: "system", content: systemPrompt },
+      { role: "user", content: JSON.stringify(userPayload) },
+    ];
+
+    try {
+      const completion = await requestStructuredJson({
+        client,
+        ...buildTaskModelPlan("attachmentValidation", modelAssignments),
+        messages,
+      });
+
+      const { model, parsed } = completion;
+      const modelSummary = normalizeText(parsed.summary, 280);
+      const modelFeedback = normalizeStringList(parsed.feedback, 6);
+      const checklistResults = isArchitecturalPlansValidation
+        ? buildChecklistRows(parsed.checklistResults, {
+            notesForCheckItems: architecturalChecklistItems,
+            notesForCheckPath: notesForCheckContext.sourcePath,
+            fileName,
+            expectedDocument: normalizedExpectedDocument,
+            detectedDocuments: normalizedDetectedDocuments,
+            notes: normalizedNotes,
+            extractedText: normalizeText(extractedText, 6000),
+          }).map((row) => ({
+            item: row.item,
+            status: normalizeAttachmentChecklistStatus(row.status),
+            comment:
+              normalizeText(row.comment, 320) ||
+              "لم يتم العثور على دليل صريح لهذا البند داخل الملف الحالي.",
+          }))
+        : [];
+
+      if (!modelSummary || modelFeedback.length === 0) {
+        return res.status(502).json({
+          error:
+            "AI validation response was incomplete. The model did not return usable feedback for this file.",
+        });
+      }
+
+      return res.json({
+        model,
+        status: normalizeAttachmentValidationStatus(parsed.status),
+        summary: modelSummary,
+        feedback: modelFeedback,
+        confidence: normalizeConfidence(parsed.confidence),
+        ...(checklistResults.length > 0 ? { checklistResults } : {}),
+      });
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : "Attachment validation failed";
+      console.error("validate-attachment failed", {
+        taskModelPlan: buildTaskModelPlan(
+          "attachmentValidation",
+          modelAssignments,
+        ),
         message,
       });
       return res.status(500).json({ error: message });
@@ -852,22 +3005,43 @@ export function createReviewApp({
       ruleReview.missingDocuments ?? [],
       policy.workflow ?? [],
     );
+    const projectTypeContext = resolveSelectedProjectType(policy, submission);
+    const effectiveRequiredDocuments = projectTypeContext.selectedSubtype
+      ?.requiredDocuments?.length
+      ? projectTypeContext.selectedSubtype.requiredDocuments
+      : policy.requiredDocuments;
     const trackedDocuments = AI_TRACKED_DOCUMENTS.filter(
       (documentName) =>
-        Array.isArray(policy.requiredDocuments) &&
-        policy.requiredDocuments.includes(documentName),
+        Array.isArray(effectiveRequiredDocuments) &&
+        effectiveRequiredDocuments.includes(documentName),
     );
+    const structuredNotesForCheck = partitionNotesForCheckItems(
+      notesForCheckContext.checklistItems,
+    );
+    const notesForCheckItems = structuredNotesForCheck.architecturalItems;
+    const consistencyCheckItems = structuredNotesForCheck.consistencyItems;
 
     const systemPrompt = [
       "You are an expert municipal engineering license reviewer for Riyadh Municipality.",
       "Respond only with valid JSON.",
-      "Base the review strictly on the provided policy knowledge context, workflow evidence, uploaded attachment text, and rule-based review.",
+      "Be strict, deterministic, and evidence-based.",
+      "Never skip any step in the validation pipeline.",
+      "Do not assume missing data. Explicitly mark it as Missing.",
+      "If uncertainty exists, mark it as Unable to Verify. Do not guess.",
+      "Always reference which file or section your conclusion is based on whenever sourceRefs are requested.",
+      "Base the review strictly on the provided policy knowledge context, workflow evidence, uploaded attachment text, rule-based review, and the Notes for Check workbook items.",
       "Treat the rule-based review as the primary baseline and provide supplemental reasoning, nuance, and risk assessment on top of it.",
       "Do not override deterministic missing-document findings unless the uploaded text clearly supports a correction.",
       "When tracked engineering sheets are requested, evaluate each one directly from the uploaded sheet text and detected sheet titles as the source evidence.",
-      "For each tracked sheet, state whether it is missing, present but still needs human review, or sufficiently evidenced by the uploaded sheet content.",
       "For each tracked sheet validation, include one to three short evidence snippets copied or closely paraphrased from the uploaded sheet text.",
+      "For architectural compliance, use the Unified Requirements source plus the Notes for Check workbook as validation sources.",
+      "When the architectural plans attachment is present, complianceReport.architecturalCompliance.notesForCheck must include one row for every architectural Notes for Check item using the exact item text provided in the payload.",
+      "When the architectural plans attachment is present, complianceReport.dataConsistencyCheck must also include one row for every workbook-driven consistency item using the exact field text provided in the payload, in addition to the baseline identity consistency rows.",
+      "The complianceReport object must follow the requested step-by-step structure exactly and must cover project type detection, attachment completeness, deed and beneficiary data consistency, attachment accuracy, requirements compliance, Notes for Check validation, violations, and final summary.",
+      "Inside complianceReport, use only these exact status values: Present, Missing, Invalid / Unclear, Match, Mismatch, Missing, Valid, Invalid, Partially Valid, Compliant, Non-Compliant, Not Found, Complete, Incomplete.",
       "Suggested responses must be short operational replies that a municipal reviewer can send back to the engineering office, each tagged with an action type.",
+      "If a project type and subtype are provided, interpret the policy in light of that exact classification and prefer source-grounded subtype-specific requirements over generic assumptions.",
+      "If project type options are provided but no selection was made, mention the missing classification as a review limitation instead of inventing one.",
       "Write all user-facing strings in Arabic.",
       "Do not invent regulations that are not supported by the provided source excerpts.",
       "Return a conservative recommendation for human approval support, not a legally binding final decision.",
@@ -875,7 +3049,7 @@ export function createReviewApp({
 
     const userPayload = {
       instruction:
-        "قدم مراجعة عربية غنية للمعاملة. حدد القرار، لخص السبب، اذكر أوجه القوة والقصور، اقترح إجراءات عملية، واستشهد فقط بالأدلة المتاحة.",
+        "حلل الملفات، تحقق منها، ثم أخرج تقرير امتثال منظم وفق الخطوات التالية دون تخطي أي خطوة: 1) تحديد نوع المشروع وتحديد المرفقات المطلوبة. 2) فحص اكتمال المرفقات وتصنيف كل مرفق Present أو Missing أو Invalid / Unclear. 3) التحقق من اتساق بيانات المستفيد والصك عبر Plot Number وBeneficiary Name وEngineering Office وPlan Number وDeed Number. 4) التحقق من دقة المرفقات ومدى ارتباطها الفعلي بالصك ونوع المشروع. 5) مراجعة الامتثال المعماري بالاعتماد على ملف الاشتراطات الموحد وملف Notes for Check والمخططات المعمارية، مع فحص جميع عناصر Notes for Check وإخراج المخالفات بوضوح. 6) إصدار ملخص نهائي قرار-جاهز واضح ومباشر.",
       outputSchema: {
         model: "string",
         decision: "approve-with-human-check | needs-more-info | reject-for-now",
@@ -891,21 +3065,75 @@ export function createReviewApp({
           "Array<{actionType: request-completion|return-to-reviewer|escalate-to-supervisor, title:string, text:string, rationale:string}>",
         evidence:
           "Array<{label:string, sourcePath:string, excerpt:string, relevance:string}>",
+        complianceReport: {
+          projectInformation: {
+            projectType: "string",
+            confidenceLevel: "High | Medium | Low",
+          },
+          attachmentsStatus: {
+            overallStatus: "Complete | Incomplete",
+            rows: "Array<{attachment:string, status:Present|Missing|Invalid / Unclear, notes:string, sourceRefs:string[]}>",
+          },
+          dataConsistencyCheck:
+            "Array<{field:string, sak:string, otherDocs:string, status:Match|Mismatch|Missing, sourceRefs:string[]}>",
+          attachmentAccuracy: {
+            status: "Valid | Invalid | Partially Valid",
+            notes: "string[]",
+          },
+          architecturalCompliance: {
+            requirementsCompliance: "Compliant | Not Compliant",
+            notesForCheck:
+              "Array<{item:string, status:Compliant|Non-Compliant|Not Found, comment:string, sourceRefs:string[]}>",
+            violations: "string[]",
+          },
+          finalSummary: {
+            attachments: "string",
+            dataConsistency: "string",
+            architecturalCompliance: "string",
+            keyIssues: "string[]",
+          },
+        },
       },
       policy: {
         id: policy.id,
         title: policy.title,
         references: policy.references,
-        requiredDocuments: policy.requiredDocuments,
+        requiredDocuments: effectiveRequiredDocuments,
+        requiredDocumentsDetailed: effectiveRequiredDocuments.map(
+          (documentName) => ({
+            number: CHECKLIST_DOCUMENT_CATALOG[documentName] || "",
+            title: documentName,
+          }),
+        ),
         workflow: policy.workflow,
+        projectTypes: projectTypeContext.availableGroups,
         sourcePath: knowledgeContext.sourcePath,
         sourceCitations: knowledgeContext.citations,
+      },
+      architecturalValidationSources: {
+        unifiedRequirementsSourcePath: knowledgeContext.sourcePath,
+        notesForCheckSourcePath: notesForCheckContext.sourcePath,
+        notesForCheckFileName: notesForCheckContext.fileName,
+        notesForCheckItems,
+        consistencyCheckItems,
+        structuredWorkbookRows: structuredNotesForCheck.allEntries.map(
+          (item) => ({
+            section: item.section,
+            item: item.text,
+            kind: item.kind,
+            rowNumber: item.rowNumber,
+          }),
+        ),
       },
       submission: {
         applicantName: submission.applicantName,
         officeName: submission.officeName,
         district: submission.district,
         plotNumber: submission.plotNumber,
+        projectTypeGroupId: submission.projectTypeGroupId,
+        projectSubtypeId: submission.projectSubtypeId,
+        projectTypeGroupTitle: projectTypeContext.selectedGroup?.title ?? "",
+        projectSubtypeTitle: projectTypeContext.selectedSubtype?.title ?? "",
         projectDescription: submission.projectDescription,
         comments: submission.comments,
         attachments: compactAttachments(submission.uploadedAttachments ?? []),
@@ -929,31 +3157,23 @@ export function createReviewApp({
         { role: "user", content: JSON.stringify(userPayload) },
       ];
 
-      let completion;
-      try {
-        completion = await requestStructuredJson({
-          client,
-          model: reviewModel,
-          messages,
-        });
-      } catch (primaryError) {
-        if (!fallbackModel || fallbackModel === reviewModel) {
-          throw primaryError;
-        }
-
-        completion = await requestStructuredJson({
-          client,
-          model: fallbackModel,
-          messages,
-        });
-      }
+      const completion = await requestStructuredJson({
+        client,
+        ...buildTaskModelPlan("llmReview", modelAssignments),
+        messages,
+      });
 
       const { model, parsed } = completion;
+      const derivedConfidence = deriveConfidence(
+        parsed.confidence,
+        submission,
+        ruleReview,
+      );
       return res.json({
         model,
         generatedAt: new Date().toISOString(),
         decision: parsed.decision,
-        confidence: deriveConfidence(parsed.confidence, submission, ruleReview),
+        confidence: derivedConfidence,
         summary: parsed.summary,
         reasoning: parsed.reasoning ?? [],
         missingItems: parsed.missingItems ?? [],
@@ -967,6 +3187,23 @@ export function createReviewApp({
         suggestedResponses: normalizeSuggestedResponses(
           parsed.suggestedResponses,
         ),
+        complianceReport: normalizeComplianceReport(parsed.complianceReport, {
+          requiredDocuments: effectiveRequiredDocuments,
+          attachments: submission.uploadedAttachments ?? [],
+          submission,
+          matchedDocuments: Array.isArray(ruleReview.matchedDocuments)
+            ? ruleReview.matchedDocuments
+            : [],
+          missingDocuments: Array.isArray(ruleReview.missingDocuments)
+            ? ruleReview.missingDocuments
+            : [],
+          projectTypeGroupTitle: projectTypeContext.selectedGroup?.title ?? "",
+          projectSubtypeTitle: projectTypeContext.selectedSubtype?.title ?? "",
+          notesForCheckItems,
+          consistencyCheckItems,
+          notesForCheckPath: notesForCheckContext.sourcePath,
+          confidence: derivedConfidence,
+        }),
         evidence: Array.isArray(parsed.evidence)
           ? parsed.evidence
           : knowledgeContext.citations,
@@ -1000,6 +3237,11 @@ export function startReviewServer(port = Number(process.env.PORT) || 8787) {
     console.log(
       `LLM review server listening on http://127.0.0.1:${port} using review model ${process.env.OPENAI_UI_REVIEW_MODEL || process.env.OPENAI_MODEL || DEFAULT_REVIEW_MODEL} and extraction model ${process.env.OPENAI_UI_EXTRACTION_MODEL || process.env.OPENAI_MODEL || DEFAULT_EXTRACTION_MODEL}`,
     );
+    if (!process.env.OPENAI_API_KEY) {
+      console.warn(
+        "OPENAI_API_KEY is still missing after env loading. Checked project .env files, cwd .env files, and accelerator/.env.",
+      );
+    }
   });
 }
 

@@ -13,6 +13,7 @@ export async function requestAttachmentExtraction(input: {
   mimeType: string;
   requiredDocuments: string[];
   localExtractedText: string;
+  extractionMode?: "standard" | "cad-critical";
   pageImages: Array<{
     pageNumber: number;
     dataUrl: string;
