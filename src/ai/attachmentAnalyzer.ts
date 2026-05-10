@@ -17,6 +17,7 @@ import type {
   UploadedAttachment,
 } from "../types";
 import { getSearchTerms, normalizeArabic } from "./policySearch";
+import type { Locale } from "../utils/localization";
 
 GlobalWorkerOptions.workerSrc = new URL(
   "pdfjs-dist/build/pdf.worker.mjs",
@@ -65,6 +66,7 @@ const PDF_TEXT_READ_CONCURRENCY = Math.min(
 
 type AnalyzeAttachmentsOptions = {
   onProgress?: (event: AttachmentAnalysisTraceEvent) => void;
+  locale?: Locale;
 };
 
 type ProgressReporter = (
@@ -728,6 +730,7 @@ async function readPdf(
   file: File,
   policy: LicensePolicy,
   reportProgress: ProgressReporter,
+  locale: Locale,
 ): Promise<{
   extractedText: string;
   detectedDocuments: string[];
@@ -887,6 +890,7 @@ async function readPdf(
           mimeType: file.type || "application/pdf",
           requiredDocuments: policy.requiredDocuments,
           extractionMode: cadMode ? "cad-critical" : "standard",
+          locale,
           localExtractedText: pageBatch
             .map((pageNumber) => pages[pageNumber - 1] ?? "")
             .join("\n\n")
@@ -1055,6 +1059,7 @@ async function extractText(
   file: File,
   policy: LicensePolicy,
   reportProgress: ProgressReporter,
+  locale: Locale,
 ): Promise<{
   sourceType: UploadedAttachment["sourceType"];
   extractedText: string;
@@ -1074,7 +1079,7 @@ async function extractText(
   });
 
   if (lowerName.endsWith(".pdf")) {
-    const pdfResult = await readPdf(file, policy, reportProgress);
+    const pdfResult = await readPdf(file, policy, reportProgress, locale);
     return { sourceType: "pdf", ...pdfResult };
   }
   if (lowerName.endsWith(".docx")) {
@@ -1158,6 +1163,7 @@ export async function analyzeAttachments(
   policy: LicensePolicy,
   options: AnalyzeAttachmentsOptions = {},
 ): Promise<UploadedAttachment[]> {
+  const locale = options.locale ?? "ar";
   const reportProgress = createProgressReporter(options.onProgress);
   reportProgress({
     operationKey: "upload-all",
@@ -1177,7 +1183,7 @@ export async function analyzeAttachments(
         detectedDocuments: seededDocuments,
         notes: seededNotes,
         aiConfidence,
-      } = await extractText(file, policy, reportProgress);
+      } = await extractText(file, policy, reportProgress, locale);
       const { detectedDocuments, notes } = detectDocuments(
         policy,
         extractedText,
@@ -1221,6 +1227,7 @@ export async function analyzeAttachments(
           extractedText,
           detectedDocuments,
           notes,
+          locale,
         });
 
         aiValidation = {

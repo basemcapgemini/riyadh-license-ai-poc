@@ -266,6 +266,22 @@ function getEnvironmentCandidates(root = projectRoot) {
   ].filter(Boolean);
 }
 
+function normalizeLocale(value) {
+  return value === "en" ? "en" : "ar";
+}
+
+function getUserFacingLanguageName(locale) {
+  return locale === "en" ? "English" : "Arabic";
+}
+
+function buildUserFacingLanguageInstruction(locale) {
+  return `Write all user-facing strings in ${getUserFacingLanguageName(locale)}.`;
+}
+
+function getLocalizedText(locale, arabicText, englishText) {
+  return locale === "en" ? englishText : arabicText;
+}
+
 function getModelCapability(modelName) {
   const normalizedModelName = String(modelName || "").trim();
 
@@ -994,6 +1010,7 @@ function normalizeDocumentValidations(
   value,
   allowedDocuments,
   fallbackValidations = [],
+  locale = "ar",
 ) {
   const fallbackByName = new Map(
     (Array.isArray(fallbackValidations) ? fallbackValidations : [])
@@ -1048,15 +1065,24 @@ function normalizeDocumentValidations(
     return {
       documentName,
       status: "missing",
-      summary: `لم يتمكن التحليل من تأكيد وجود ${documentName} داخل الملفات المرفوعة.`,
-      details: ["تحتاج هذه الورقة إلى رفع أوضح أو مراجعة بشرية مباشرة."],
+      summary:
+        locale === "en"
+          ? `The analysis could not confirm the presence of ${documentName} in the uploaded files.`
+          : `لم يتمكن التحليل من تأكيد وجود ${documentName} داخل الملفات المرفوعة.`,
+      details: [
+        getLocalizedText(
+          locale,
+          "تحتاج هذه الورقة إلى رفع أوضح أو مراجعة بشرية مباشرة.",
+          "This sheet needs a clearer upload or a direct human review.",
+        ),
+      ],
       evidenceSnippets: [],
       source: "rule",
     };
   });
 }
 
-function normalizeSuggestedResponses(value, maxItems = 6) {
+function normalizeSuggestedResponses(value, locale = "ar", maxItems = 6) {
   if (!Array.isArray(value)) {
     return [];
   }
@@ -1066,7 +1092,7 @@ function normalizeSuggestedResponses(value, maxItems = 6) {
       if (typeof item === "string") {
         return {
           actionType: "request-completion",
-          title: "طلب استكمال",
+          title: getLocalizedText(locale, "طلب استكمال", "Request completion"),
           text: normalizeText(item, 500),
           rationale: "",
           source: "ai",
@@ -1084,7 +1110,9 @@ function normalizeSuggestedResponses(value, maxItems = 6) {
 
       return {
         actionType: normalizeSuggestedResponseActionType(item.actionType),
-        title: normalizeText(item.title, 120) || "إجراء مقترح",
+        title:
+          normalizeText(item.title, 120) ||
+          getLocalizedText(locale, "إجراء مقترح", "Suggested action"),
         text,
         rationale: normalizeText(item.rationale, 240),
         source: "ai",
@@ -2704,7 +2732,9 @@ export function createReviewApp(options = {}) {
       requiredDocuments,
       extractionMode,
       pageImages,
+      locale,
     } = req.body ?? {};
+    const requestLocale = normalizeLocale(locale);
     if (
       !fileName ||
       !Array.isArray(requiredDocuments) ||
@@ -2741,7 +2771,7 @@ export function createReviewApp(options = {}) {
       "Respond only with valid JSON.",
       "Use the local extracted text as weak prior context, but correct it using the page images when the OCR is incomplete.",
       "Be conservative and do not claim a required document is present unless the page image or visible labels support it.",
-      "Write all user-facing strings in Arabic.",
+      buildUserFacingLanguageInstruction(requestLocale),
       "Keep extractedText concise and focused on document names, headings, stamps, and visible sheet titles.",
       "If architectural-plan pages visually show parking bays, car slots, garage areas, ramps, or a parking layout, mention that evidence in extractedText or notes even when the sheet does not explicitly say parking.",
       "Mention accessibility requirements only when they are clearly shown in the plan, such as wheelchair routes, accessible ramps, accessible toilets, accessibility labels, or dedicated disabled parking. Do not infer them from generic circulation unless the evidence is explicit.",
@@ -2755,7 +2785,10 @@ export function createReviewApp(options = {}) {
 
     const userPayload = {
       instruction:
-        "استخرج النصوص والعناوين الظاهرة التي تساعد على التعرف على نوع المستندات داخل الملف الهندسي. راجع كل صفحة مرفقة بصرياً، وركز على خانة عنوان اللوحة، اسم التخصص، الأختام، ورؤوس الجداول. ثم حدد المستندات المطلوبة التي تظهر بوضوح أو بدلالة قوية في الصفحات. إذا ظهر عنوان قريب من اسم المستند المطلوب فارجعه باسم المستند المطلوب نفسه. وإذا أظهرت اللوحة المعمارية مواقف سيارات مرسومة بصرياً أو صفوف مواقف أو كراج أو منحدر سيارات حتى دون عنوان نصي واضح، فاذكر ذلك صراحة داخل extractedText أو notes لأنه دليل مهم لبند مواقف السيارات. أما متطلبات ذوي الإعاقة (إن وجد) فلا تذكرها إلا إذا ظهرت بوضوح مثل منحدر مخصص أو مسار كرسي متحرك أو دورة مياه مخصصة أو وسم صريح لذلك داخل المخطط.",
+        requestLocale === "en"
+          ? "Extract the visible text, titles, and labels that help identify the document types inside this engineering attachment. Review each attached page visually and focus on the title block, discipline name, stamps, and table headings. Then identify which required documents are clearly shown or strongly supported by the pages. If a title is close to the required document name, return the required document name itself. If the architectural plan visually shows parking bays, parking rows, a garage, or a vehicle ramp even without a clear text title, mention that explicitly in extractedText or notes because it is important evidence for the parking item. Mention accessibility requirements only when they are clearly shown, such as a dedicated ramp, wheelchair route, dedicated toilet, or explicit label in the plan."
+          : "استخرج النصوص والعناوين الظاهرة التي تساعد على التعرف على نوع المستندات داخل الملف الهندسي. راجع كل صفحة مرفقة بصرياً، وركز على خانة عنوان اللوحة، اسم التخصص، الأختام، ورؤوس الجداول. ثم حدد المستندات المطلوبة التي تظهر بوضوح أو بدلالة قوية في الصفحات. إذا ظهر عنوان قريب من اسم المستند المطلوب فارجعه باسم المستند المطلوب نفسه. وإذا أظهرت اللوحة المعمارية مواقف سيارات مرسومة بصرياً أو صفوف مواقف أو كراج أو منحدر سيارات حتى دون عنوان نصي واضح، فاذكر ذلك صراحة داخل extractedText أو notes لأنه دليل مهم لبند مواقف السيارات. أما متطلبات ذوي الإعاقة (إن وجد) فلا تذكرها إلا إذا ظهرت بوضوح مثل منحدر مخصص أو مسار كرسي متحرك أو دورة مياه مخصصة أو وسم صريح لذلك داخل المخطط.",
+      userFacingLanguage: getUserFacingLanguageName(requestLocale),
       outputSchema: {
         extractedText: "string",
         detectedDocuments: "string[] subset of requiredDocuments",
@@ -2839,7 +2872,9 @@ export function createReviewApp(options = {}) {
       extractedText,
       detectedDocuments,
       notes,
+      locale,
     } = req.body ?? {};
+    const requestLocale = normalizeLocale(locale);
 
     if (
       !fileName ||
@@ -2887,13 +2922,18 @@ export function createReviewApp(options = {}) {
       "For the parking checklist item, accept parking evidence reflected in extractedText or notes even if the sheet title does not explicitly mention parking, especially when the source describes drawn parking bays, garage areas, ramps, or visual parking layout.",
       "For the accessibility checklist item, mention it only when there is explicit evidence in the extractedText or notes, such as wheelchair paths, accessibility labels, accessible toilets, accessible ramps, or dedicated disabled parking. If it is not clearly shown, leave it as Not Found.",
       "Be strict and concise. Do not guess.",
-      "Write all user-facing strings in Arabic.",
+      buildUserFacingLanguageInstruction(requestLocale),
     ].join(" ");
 
     const userPayload = {
       instruction: isArchitecturalPlansValidation
-        ? "قيّم هذا الملف الواحد فقط. هل يطابق المتطلب المطلوب؟ ثم افحص جميع بنود checklist الخاصة بالمخططات المعمارية الواردة في الحمولة وأخرج status وsummary وfeedback مع checklistResults بحيث يحتوي كل بند على item وstatus وcomment بشكل مباشر وقابل للعرض تحت خانة الرفع. في بند مواقف السيارات اعتبر الوصف الذي يذكر مواقف مرسومة أو صفوف مواقف أو كراج أو منحدر سيارات دليلاً صالحاً حتى لو لم يظهر اسم البند نصاً داخل اللوحة. أما بند متطلبات ذوي الإعاقة (إن وجد) فلا تذكره إلا إذا ظهر صراحة في النص أو الملاحظات المستخرجة مثل منحدر مخصص أو مسار كرسي متحرك أو دورة مياه مخصصة أو وسم واضح لذلك."
-        : "قيّم هذا الملف الواحد فقط. هل يطابق المتطلب المطلوب؟ أخرج status وsummary وfeedback بشكل مباشر وقابل للعرض تحت خانة الرفع.",
+        ? requestLocale === "en"
+          ? "Evaluate this single file only. Does it match the expected required attachment? Then review every architectural checklist item provided in the payload and return status, summary, feedback, and checklistResults, where each row includes item, status, and comment in a direct format suitable for the upload slot. For the parking item, treat descriptions of drawn parking bays, parking rows, garages, or vehicle ramps as valid evidence even when the item name does not appear explicitly in the sheet. Mention the accessibility item only when it is explicitly visible in the extracted text or notes, such as a dedicated ramp, wheelchair route, dedicated toilet, or a clear accessibility label."
+          : "قيّم هذا الملف الواحد فقط. هل يطابق المتطلب المطلوب؟ ثم افحص جميع بنود checklist الخاصة بالمخططات المعمارية الواردة في الحمولة وأخرج status وsummary وfeedback مع checklistResults بحيث يحتوي كل بند على item وstatus وcomment بشكل مباشر وقابل للعرض تحت خانة الرفع. في بند مواقف السيارات اعتبر الوصف الذي يذكر مواقف مرسومة أو صفوف مواقف أو كراج أو منحدر سيارات دليلاً صالحاً حتى لو لم يظهر اسم البند نصاً داخل اللوحة. أما بند متطلبات ذوي الإعاقة (إن وجد) فلا تذكره إلا إذا ظهر صراحة في النص أو الملاحظات المستخرجة مثل منحدر مخصص أو مسار كرسي متحرك أو دورة مياه مخصصة أو وسم واضح لذلك."
+        : requestLocale === "en"
+          ? "Evaluate this single file only. Does it match the expected required attachment? Return status, summary, and feedback in a direct format suitable for display under the upload slot."
+          : "قيّم هذا الملف الواحد فقط. هل يطابق المتطلب المطلوب؟ أخرج status وsummary وfeedback بشكل مباشر وقابل للعرض تحت خانة الرفع.",
+      userFacingLanguage: getUserFacingLanguageName(requestLocale),
       outputSchema: {
         status: "passed | warning | missing",
         summary: "string",
@@ -2950,7 +2990,11 @@ export function createReviewApp(options = {}) {
             status: normalizeAttachmentChecklistStatus(row.status),
             comment:
               normalizeText(row.comment, 320) ||
-              "لم يتم العثور على دليل صريح لهذا البند داخل الملف الحالي.",
+              getLocalizedText(
+                requestLocale,
+                "لم يتم العثور على دليل صريح لهذا البند داخل الملف الحالي.",
+                "No explicit evidence for this item was found in the current file.",
+              ),
           }))
         : [];
 
@@ -2991,12 +3035,13 @@ export function createReviewApp(options = {}) {
       });
     }
 
-    const { policy, submission, ruleReview } = req.body ?? {};
+    const { policy, submission, ruleReview, locale } = req.body ?? {};
     if (!policy || !submission || !ruleReview) {
       return res
         .status(400)
         .json({ error: "Missing policy, submission, or ruleReview payload." });
     }
+    const requestLocale = normalizeLocale(locale);
 
     const knowledgeContext = buildKnowledgeContext(
       knowledgeBase,
@@ -3042,14 +3087,17 @@ export function createReviewApp(options = {}) {
       "Suggested responses must be short operational replies that a municipal reviewer can send back to the engineering office, each tagged with an action type.",
       "If a project type and subtype are provided, interpret the policy in light of that exact classification and prefer source-grounded subtype-specific requirements over generic assumptions.",
       "If project type options are provided but no selection was made, mention the missing classification as a review limitation instead of inventing one.",
-      "Write all user-facing strings in Arabic.",
+      buildUserFacingLanguageInstruction(requestLocale),
       "Do not invent regulations that are not supported by the provided source excerpts.",
       "Return a conservative recommendation for human approval support, not a legally binding final decision.",
     ].join(" ");
 
     const userPayload = {
       instruction:
-        "حلل الملفات، تحقق منها، ثم أخرج تقرير امتثال منظم وفق الخطوات التالية دون تخطي أي خطوة: 1) تحديد نوع المشروع وتحديد المرفقات المطلوبة. 2) فحص اكتمال المرفقات وتصنيف كل مرفق Present أو Missing أو Invalid / Unclear. 3) التحقق من اتساق بيانات المستفيد والصك عبر Plot Number وBeneficiary Name وEngineering Office وPlan Number وDeed Number. 4) التحقق من دقة المرفقات ومدى ارتباطها الفعلي بالصك ونوع المشروع. 5) مراجعة الامتثال المعماري بالاعتماد على ملف الاشتراطات الموحد وملف Notes for Check والمخططات المعمارية، مع فحص جميع عناصر Notes for Check وإخراج المخالفات بوضوح. 6) إصدار ملخص نهائي قرار-جاهز واضح ومباشر.",
+        requestLocale === "en"
+          ? "Analyze the files, validate them, then return a structured compliance report without skipping any step: 1) identify the project type and required attachments, 2) check attachment completeness and classify each attachment as Present, Missing, or Invalid / Unclear, 3) verify deed and beneficiary data consistency across Plot Number, Beneficiary Name, Engineering Office, Plan Number, and Deed Number, 4) verify attachment accuracy and whether the files truly match the deed and project type, 5) review architectural compliance using the unified requirements source, the Notes for Check workbook, and the architectural plans, including every Notes for Check item and any violations, 6) provide a clear final summary suitable for decision support."
+          : "حلل الملفات، تحقق منها، ثم أخرج تقرير امتثال منظم وفق الخطوات التالية دون تخطي أي خطوة: 1) تحديد نوع المشروع وتحديد المرفقات المطلوبة. 2) فحص اكتمال المرفقات وتصنيف كل مرفق Present أو Missing أو Invalid / Unclear. 3) التحقق من اتساق بيانات المستفيد والصك عبر Plot Number وBeneficiary Name وEngineering Office وPlan Number وDeed Number. 4) التحقق من دقة المرفقات ومدى ارتباطها الفعلي بالصك ونوع المشروع. 5) مراجعة الامتثال المعماري بالاعتماد على ملف الاشتراطات الموحد وملف Notes for Check والمخططات المعمارية، مع فحص جميع عناصر Notes for Check وإخراج المخالفات بوضوح. 6) إصدار ملخص نهائي قرار-جاهز واضح ومباشر.",
+      userFacingLanguage: getUserFacingLanguageName(requestLocale),
       outputSchema: {
         model: "string",
         decision: "approve-with-human-check | needs-more-info | reject-for-now",
@@ -3170,6 +3218,7 @@ export function createReviewApp(options = {}) {
         ruleReview,
       );
       return res.json({
+        locale: requestLocale,
         model,
         generatedAt: new Date().toISOString(),
         decision: parsed.decision,
@@ -3183,9 +3232,11 @@ export function createReviewApp(options = {}) {
           parsed.documentValidations,
           trackedDocuments,
           ruleReview.documentValidations,
+          requestLocale,
         ),
         suggestedResponses: normalizeSuggestedResponses(
           parsed.suggestedResponses,
+          requestLocale,
         ),
         complianceReport: normalizeComplianceReport(parsed.complianceReport, {
           requiredDocuments: effectiveRequiredDocuments,

@@ -225,6 +225,7 @@ export type ComplianceReport = {
 };
 
 export type LlmReview = {
+  locale?: "ar" | "en";
   model: string;
   generatedAt: string;
   decision: LlmReviewDecision;

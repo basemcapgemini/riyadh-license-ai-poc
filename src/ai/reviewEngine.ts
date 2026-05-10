@@ -11,6 +11,7 @@ import {
   buildWorkflowEvidence,
 } from "./policyEvidence";
 import { getPolicyKnowledge } from "../data/policyKnowledgeBase";
+import { translateDisplayText, type Locale } from "../utils/localization";
 
 function unique(values: string[]): string[] {
   return Array.from(new Set(values));
@@ -348,9 +349,37 @@ function buildSuggestedResponses(
   );
 }
 
+function localizeValidation(
+  validation: DocumentValidation,
+  locale: Locale,
+): DocumentValidation {
+  return {
+    ...validation,
+    summary: translateDisplayText(validation.summary, locale),
+    details: validation.details.map((detail) =>
+      translateDisplayText(detail, locale),
+    ),
+  };
+}
+
+function localizeSuggestedResponse(
+  response: SuggestedResponse,
+  locale: Locale,
+): SuggestedResponse {
+  return {
+    ...response,
+    title: translateDisplayText(response.title, locale),
+    text: translateDisplayText(response.text, locale),
+    rationale: response.rationale
+      ? translateDisplayText(response.rationale, locale)
+      : response.rationale,
+  };
+}
+
 export function reviewApplication(
   policy: LicensePolicy,
   form: SubmissionForm,
+  locale: Locale = "ar",
 ): ReviewResult {
   const matchedDocuments = policy.requiredDocuments.filter((document) =>
     form.selectedDocuments.includes(document),
@@ -472,13 +501,19 @@ export function reviewApplication(
   return {
     score,
     status,
-    summary: summaryByStatus[status],
+    summary: translateDisplayText(summaryByStatus[status], locale),
     missingDocuments,
     matchedDocuments,
-    policyAlerts,
-    documentValidations,
-    suggestedResponses,
-    nextStep: nextStepByStatus[status],
+    policyAlerts: policyAlerts.map((alert) =>
+      translateDisplayText(alert, locale),
+    ),
+    documentValidations: documentValidations.map((validation) =>
+      localizeValidation(validation, locale),
+    ),
+    suggestedResponses: suggestedResponses.map((response) =>
+      localizeSuggestedResponse(response, locale),
+    ),
+    nextStep: translateDisplayText(nextStepByStatus[status], locale),
     sourcePath,
     evidence: [
       ...policyEvidence,

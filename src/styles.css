@@ -107,6 +107,30 @@ textarea {
   opacity: 0.7;
 }
 
+.language-switch {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.14);
+}
+
+.language-switch button {
+  border: 0;
+  background: transparent;
+  color: rgba(255, 255, 255, 0.86);
+  padding: 8px 12px;
+  border-radius: 999px;
+  cursor: pointer;
+  font-weight: 600;
+}
+
+.language-switch button.active {
+  background: #fff;
+  color: var(--primary-strong);
+}
+
 .smart-disclosure {
   width: 100%;
 }

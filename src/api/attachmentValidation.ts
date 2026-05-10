@@ -1,5 +1,6 @@
 import { fetchJson } from "./http";
 import type { AttachmentAiValidation } from "../types";
+import type { Locale } from "../utils/localization";
 
 export type AttachmentValidationResult = AttachmentAiValidation & {
   model: string;
@@ -14,6 +15,7 @@ export async function requestAttachmentValidation(input: {
   extractedText: string;
   detectedDocuments: string[];
   notes: string[];
+  locale: Locale;
 }): Promise<AttachmentValidationResult> {
   return fetchJson<AttachmentValidationResult>(
     "/api/validate-attachment",
@@ -22,6 +24,9 @@ export async function requestAttachmentValidation(input: {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(input),
     },
-    "فشل تشغيل التحقق الذكي من المرفق.",
+    input.locale === "en"
+      ? "Failed to run AI attachment validation."
+      : "فشل تشغيل التحقق الذكي من المرفق.",
+    input.locale,
   );
 }

@@ -1,4 +1,5 @@
 import { fetchJson } from "./http";
+import type { Locale } from "../utils/localization";
 
 export type AttachmentExtractionResult = {
   model: string;
@@ -14,6 +15,7 @@ export async function requestAttachmentExtraction(input: {
   requiredDocuments: string[];
   localExtractedText: string;
   extractionMode?: "standard" | "cad-critical";
+  locale: Locale;
   pageImages: Array<{
     pageNumber: number;
     dataUrl: string;
@@ -26,6 +28,9 @@ export async function requestAttachmentExtraction(input: {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(input),
     },
-    "فشل تشغيل الاستخراج الذكي للمرفق.",
+    input.locale === "en"
+      ? "Failed to run AI attachment extraction."
+      : "فشل تشغيل الاستخراج الذكي للمرفق.",
+    input.locale,
   );
 }
