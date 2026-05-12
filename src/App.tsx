@@ -2293,7 +2293,7 @@ export default function App() {
       <section className="top-strip">
         <div className="top-strip-title">أمانة منطقة الرياض</div>
         <div className="top-strip-meta">
-          <span>منصة تشغيل داخلية لمراجعة الرخص الهندسية</span>
+          <span>منصة تشغيل داخلية لمراجعة رخص البناء</span>
           <span>الرياض</span>
         </div>
       </section>
@@ -2321,7 +2321,7 @@ export default function App() {
           <div className="brand-copy">
             <span className="hero-kicker">أمانة منطقة الرياض</span>
             <span className="hero-subtitle">
-              تشغيل موحد لرحلة المكتب والأمانة من الاستقبال حتى الاعتماد
+              تشغيل موحد لرحلة المكاتب الهندسية  والأمانة من الاستقبال حتى الاعتماد
             </span>
           </div>
           <p>

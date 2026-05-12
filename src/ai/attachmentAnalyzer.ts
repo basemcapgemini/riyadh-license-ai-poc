@@ -27,7 +27,7 @@ const MAX_ATTACHMENT_TEXT_LENGTH = 24000;
 const MAX_AI_ATTACHMENT_TEXT_LENGTH = 6000;
 const AI_PDF_BATCH_SIZE = 6;
 const MAX_PARALLEL_ATTACHMENT_ANALYSIS = 1;
-const MAX_PDF_OCR_FALLBACK_PAGES = 6;
+const MAX_PDF_OCR_FALLBACK_PAGES = 8;
 const CAD_SAMPLE_LOCAL_TEXT_PAGES = 10;
 const CAD_CLASSIFICATION_BATCH_SIZE = 12;
 const CAD_MAX_EXTRACTION_PAGES = 18;
@@ -205,7 +205,71 @@ function createProgressReporter(
 }
 
 function hasMeaningfulPdfText(text: string): boolean {
-  return normalizeExtractedText(text).length >= 80;
+  const normalized = normalizeExtractedText(text);
+  if (normalized.length < 80) {
+    return false;
+  }
+
+  const words = normalized.split(/\s+/).filter(Boolean);
+  if (words.length === 0) {
+    return false;
+  }
+
+  const semanticHits = [
+    "غرفة",
+    "غرف",
+    "صالة",
+    "مجلس",
+    "مطبخ",
+    "حمام",
+    "نوم",
+    "مواقف",
+    "دور",
+    "ارضي",
+    "اول",
+    "ثاني",
+    "سطح",
+    "فيلا",
+    "سكني",
+    "تجاري",
+    "مساحة",
+    "مساحات",
+    "نسبة",
+    "ارتداد",
+    "ارتدادات",
+    "الارتدادات",
+    "section",
+    "elevation",
+  ].filter((term) => normalizeArabic(normalized).includes(normalizeArabic(term)));
+
+  if (semanticHits.length >= 2) {
+    return true;
+  }
+
+  const drawingTagHits = words.filter((word) =>
+    /^(?:[A-Z]{1,5}\d{0,3}|\d+(?:\.\d+)?|UPVC|sheet|project|owner|name|drawing)$/i.test(
+      word,
+    ),
+  ).length;
+  const alphaWords = words.filter((word) => /[\p{L}]/u.test(word)).length;
+  const alphaRatio = alphaWords / words.length;
+
+  if (drawingTagHits >= 6 && semanticHits.length === 0) {
+    return false;
+  }
+
+  if (alphaRatio < 0.5 && semanticHits.length === 0) {
+    return false;
+  }
+
+  if (
+    /sheet|project|owner name|drawing name/i.test(normalized) &&
+    semanticHits.length === 0
+  ) {
+    return false;
+  }
+
+  return true;
 }
 
 function hasSufficientAttachmentText(text: string): boolean {
@@ -255,9 +319,14 @@ async function runPdfOcrFallback(
     .map((pageText, index) => ({ pageNumber: index + 1, pageText }))
     .filter(({ pageText }) => !hasMeaningfulPdfText(pageText))
     .map(({ pageNumber }) => pageNumber)
-    .slice(0, MAX_PDF_OCR_FALLBACK_PAGES);
+    .filter(Boolean);
 
-  if (weakPageNumbers.length === 0) {
+  const sampledWeakPageNumbers = sampleEvenly(
+    weakPageNumbers,
+    Math.min(MAX_PDF_OCR_FALLBACK_PAGES, weakPageNumbers.length),
+  );
+
+  if (sampledWeakPageNumbers.length === 0) {
     return pages;
   }
 
@@ -266,12 +335,12 @@ async function runPdfOcrFallback(
     phase: "ocr",
     status: "running",
     title: `OCR احتياطي لملف ${fileName}`,
-    detail: `فشل التحليل الذكي أو تعذر الوصول إليه، لذلك يتم تشغيل OCR على أول ${weakPageNumbers.length} صفحات منخفضة النص فقط لتجنب التأخير الكبير.`,
+    detail: `فشل التحليل الذكي أو تعذر الوصول إليه، لذلك يتم تشغيل OCR على ${sampledWeakPageNumbers.length} صفحات منخفضة النص موزعة عبر الملف لتجنب فقدان اللوحات المهمة.`,
     fileName,
   });
 
   const ocrResults = await mapWithConcurrency(
-    weakPageNumbers,
+    sampledWeakPageNumbers,
     PDF_OCR_FALLBACK_CONCURRENCY,
     async (pageNumber) => {
       const page = await pdf.getPage(pageNumber);
@@ -775,6 +844,16 @@ async function readPdf(
   });
 
   let extractedText = normalizeExtractedText(
+    pages
+      .map((pageText, index) =>
+        pageText ? `[[page:${index + 1}]]\n${pageText}` : "",
+      )
+      .filter(Boolean)
+      .join("\n\n"),
+  ).slice(0, MAX_ATTACHMENT_TEXT_LENGTH);
+
+  pages = await runPdfOcrFallback(pdf, pages, file.name, reportProgress);
+  extractedText = normalizeExtractedText(
     pages
       .map((pageText, index) =>
         pageText ? `[[page:${index + 1}]]\n${pageText}` : "",

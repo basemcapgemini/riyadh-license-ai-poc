@@ -131,7 +131,7 @@ const TASK_MODEL_ROUTING = {
   attachmentExtractionStandard: {
     needsTextJson: true,
     needsVisionJson: true,
-    strategy: "cheapest-compatible",
+    strategy: "capability-first",
     roleOrder: [
       "extractionModel",
       "cadClassifierModel",
@@ -1301,16 +1301,438 @@ function buildChecklistEvidenceSources(context) {
   return attachmentSources.filter((source) => source.text);
 }
 
+function buildArchitecturalEvidenceText(context) {
+  return normalizeArabic(
+    [
+      context.fileName,
+      context.expectedDocument,
+      ...(Array.isArray(context.detectedDocuments)
+        ? context.detectedDocuments
+        : []),
+      ...(Array.isArray(context.notes) ? context.notes : []),
+      context.extractedText,
+    ]
+      .filter(Boolean)
+      .join("\n"),
+  );
+}
+
+function hasPositiveArchitecturalTerm(evidenceText, terms) {
+  const normalizedEvidence = normalizeArabic(evidenceText);
+  const negationWindowPattern =
+    /(لا يوجد|لا توجد|غير موجود|غير واضحة|لم يتم|لم تُرصد|لم ترصد|بدون|من دون|لا يظهر|لا تظهر|لا تذكر|لا يتم)$/;
+
+  return (Array.isArray(terms) ? terms : []).some((term) => {
+    const normalizedTerm = normalizeArabic(term);
+    if (!normalizedTerm || !normalizedEvidence.includes(normalizedTerm)) {
+      return false;
+    }
+
+    let searchIndex = normalizedEvidence.indexOf(normalizedTerm);
+    while (searchIndex >= 0) {
+      const prefix = normalizedEvidence.slice(
+        Math.max(0, searchIndex - 28),
+        searchIndex,
+      );
+      if (!negationWindowPattern.test(prefix)) {
+        return true;
+      }
+
+      searchIndex = normalizedEvidence.indexOf(
+        normalizedTerm,
+        searchIndex + normalizedTerm.length,
+      );
+    }
+
+    return false;
+  });
+}
+
+function hasArchitecturalSemanticEvidence(itemText, context) {
+  const normalizedItem = normalizeArabic(itemText);
+  const evidenceText = buildArchitecturalEvidenceText(context);
+  if (!evidenceText) {
+    return false;
+  }
+
+  if (normalizedItem === normalizeArabic("الارتدادات النظامية")) {
+    return [
+      "الارتدادات النظامية",
+      "الارتدادات",
+      "الارتداد",
+      "الارتادات",
+      "setback",
+      "setbacks",
+      "جدول الارتدادات",
+      "جدول الارتادات",
+    ].some((term) => evidenceText.includes(normalizeArabic(term)));
+  }
+
+  if (normalizedItem === normalizeArabic("نسبة البناء")) {
+    return [
+      "نسبة البناء",
+      "نسبة التغطية",
+      "coverage ratio",
+      "building ratio",
+      "جدول المساحات",
+      "جدول المسطحات",
+      "المسطحات",
+      "مسطحات البناء",
+    ].some((term) => evidenceText.includes(normalizeArabic(term)));
+  }
+
+  if (normalizedItem === normalizeArabic("عدد الأدوار والارتفاع")) {
+    return [
+      "عدد الأدوار",
+      "عدد الطوابق",
+      "الدور الأرضي",
+      "الدور الاول",
+      "الدور الثاني",
+      "الدور الثالث",
+      "دور ارضي",
+      "دور اول",
+      "دور ثاني",
+      "دور ثالث",
+      "ground floor",
+      "first floor",
+      "first floor plan",
+      "second floor",
+      "third floor",
+      "السطح",
+      "section",
+      "elevation",
+      "منسوب",
+      "مقطع",
+      "ارتفاع",
+    ].some((term) => evidenceText.includes(normalizeArabic(term)));
+  }
+
+  if (normalizedItem === normalizeArabic("مساحات الغرف والفراغات")) {
+    return [
+      "مساحات الغرف",
+      "الفراغات الداخلية",
+      "توزيع الغرف",
+      "جدول الغرف",
+      "جدول الفراغات",
+      "room schedule",
+      "room plan",
+      "dimensions",
+      "غرفة",
+      "غرف",
+      "صالة",
+      "مجلس",
+      "مطبخ",
+      "حمام",
+      "نوم",
+      "فراغ",
+    ].some((term) => evidenceText.includes(normalizeArabic(term)));
+  }
+
+  if (normalizedItem === normalizeArabic("الاستخدام مطابق للتصنيف")) {
+    return [
+      "الاستخدام مطابق للتصنيف",
+      "مطابقة الاستخدام",
+      "توصيف الاستخدام",
+      "نوع الاستخدام",
+      "الاستخدام السكني",
+      "الاستخدام التجاري",
+      "usage",
+      "occupancy",
+      "فيلا",
+      "سكني",
+      "تجاري",
+      "شقق",
+      "مبنى سكني",
+      "مبنى تجاري",
+    ].some((term) => evidenceText.includes(normalizeArabic(term)));
+  }
+
+  if (normalizedItem === normalizeArabic("مواقف السيارات")) {
+    return [
+      "مواقف السيارات",
+      "مواقف",
+      "parking",
+      "garage",
+      "كراج",
+      "مدخل سيارة",
+      "منحدر سيارات",
+      "مواقف مرسومة",
+      "صف مواقف",
+    ].some((term) => evidenceText.includes(normalizeArabic(term)));
+  }
+
+  if (normalizedItem.includes(normalizeArabic("متطلبات ذوي الإعاقة"))) {
+    return hasPositiveArchitecturalTerm(evidenceText, [
+      "ذوي الإعاقة",
+      "ذوي الاعاقة",
+      "كرسي متحرك",
+      "wheelchair",
+      "accessible ramp",
+      "accessible parking",
+      "disabled parking",
+      "دورة مياه لذوي الإعاقة",
+      "منحدر ذوي الإعاقة",
+    ]);
+  }
+
+  return false;
+}
+
+function buildArchitecturalChecklistGuidance(items) {
+  const guidanceByItem = new Map([
+    [
+      "الارتدادات النظامية",
+      {
+        aliases: [
+          "الارتدادات النظامية",
+          "الارتدادات",
+          "الارتداد",
+          "الارتادات",
+          "setback",
+          "setbacks",
+          "جدول الارتدادات",
+          "جدول الارتداد",
+          "جدول الارتادات",
+        ],
+        hints: [
+          "جدول الارتدادات",
+          "جدول الارتادات",
+          "الارتدادات النظامية",
+          "setback line",
+          "setback table",
+        ],
+      },
+    ],
+    [
+      "نسبة البناء",
+      {
+        aliases: [
+          "نسبة البناء",
+          "نسبة التغطية",
+          "coverage ratio",
+          "building ratio",
+          "جدول المساحات",
+          "مسطحات البناء",
+          "المسطحات",
+          "جدول المسطحات",
+        ],
+        hints: [
+          "جدول المساحات",
+          "جدول المسطحات",
+          "coverage ratio",
+          "building ratio",
+        ],
+      },
+    ],
+    [
+      "عدد الأدوار والارتفاع",
+      {
+        aliases: [
+          "عدد الأدوار والارتفاع",
+          "عدد الأدوار",
+          "عدد الطوابق",
+          "الارتفاع",
+          "الارتفاعات",
+          "المنسوب",
+          "المناسيب",
+          "دور أرضي",
+          "دور أول",
+          "دور ثاني",
+          "دور ثالث",
+          "مقطع",
+          "section",
+          "elevation",
+        ],
+        hints: [
+          "عدد الأدوار",
+          "الدور الأرضي",
+          "الدور الأول",
+          "مقطع",
+          "elevation",
+          "section",
+        ],
+      },
+    ],
+    [
+      "مساحات الغرف والفراغات",
+      {
+        aliases: [
+          "مساحات الغرف والفراغات",
+          "مساحات الغرف",
+          "الفراغات",
+          "الفراغات الداخلية",
+          "جدول الغرف",
+          "جدول الفراغات",
+          "جدول الفراغات الداخلية",
+          "توزيع الغرف",
+          "توزيع الفراغات",
+          "room schedule",
+          "room schedules",
+          "room spaces",
+          "room plan",
+          "room plans",
+          "schedule of rooms",
+          "internal spaces",
+          "dimensions",
+          "space schedule",
+        ],
+        hints: [
+          "جدول الغرف",
+          "الفراغات الداخلية",
+          "توزيع الغرف",
+          "جدول الفراغات",
+          "جدول الفراغات الداخلية",
+          "room schedule",
+          "dimensions",
+        ],
+      },
+    ],
+    [
+      "الاستخدام مطابق للتصنيف",
+      {
+        aliases: [
+          "الاستخدام مطابق للتصنيف",
+          "مطابقة الاستخدام",
+          "تصنيف الاستخدام",
+          "الاستخدام",
+          "الاستعمال",
+          "توصيف الاستخدام",
+          "نوع الاستخدام",
+          "وصف الاستخدام",
+          "occupancy",
+          "usage",
+          "السكني",
+          "التجاري",
+          "فيلا",
+          "شقق",
+          "مبنى سكني",
+          "مبنى تجاري",
+          "توصيف الاستخدام",
+        ],
+        hints: [
+          "السكني",
+          "التجاري",
+          "التصنيف",
+          "توصيف الاستخدام",
+          "نوع الاستخدام",
+          "occupancy",
+        ],
+      },
+    ],
+    [
+      "مواقف السيارات",
+      {
+        aliases: [
+          "مواقف السيارات",
+          "مواقف",
+          "موقف سيارة",
+          "مواقف سيارات",
+          "parking",
+          "parking bay",
+          "parking bays",
+          "parking stall",
+          "parking stalls",
+          "car park",
+          "car parking",
+          "garage",
+          "موقف",
+          "مواقف مرسومة",
+          "صف مواقف",
+          "موقفين",
+          "ثلاث مواقف",
+          "مدخل سيارة",
+          "ramps",
+          "ramp",
+          "منحدر سيارات",
+          "كراج",
+        ],
+        hints: ["مواقف مرسومة", "parking bay", "garage", "منحدر سيارات"],
+      },
+    ],
+    [
+      "متطلبات ذوي الإعاقة (إن وجد)",
+      {
+        aliases: [
+          "متطلبات ذوي الإعاقة",
+          "ذوي الإعاقة",
+          "ذوي الاعاقة",
+          "إعاقة",
+          "اعاقة",
+          "كرسي متحرك",
+          "wheelchair",
+          "منحدر ذوي الإعاقة",
+          "منحدر ذوي الاعاقة",
+          "رامب ذوي الإعاقة",
+          "رامب ذوي الاعاقة",
+          "accessible ramp",
+          "دورة مياه لذوي الإعاقة",
+          "دورة مياه لذوي الاعاقة",
+          "حمام ذوي الإعاقة",
+          "حمام ذوي الاعاقة",
+          "disabled parking",
+          "accessible parking",
+        ],
+        hints: ["منحدر ذوي الإعاقة", "wheelchair", "accessible ramp"],
+      },
+    ],
+  ]);
+
+  return (Array.isArray(items) ? items : []).map((item) => ({
+    item,
+    aliases: guidanceByItem.get(item)?.aliases || [item],
+    hints: guidanceByItem.get(item)?.hints || [item],
+  }));
+}
+
+function findArchitecturalChecklistKey(value, guidance) {
+  const normalizedValue = normalizeArabic(String(value || ""));
+  if (!normalizedValue) {
+    return "";
+  }
+
+  for (const entry of Array.isArray(guidance) ? guidance : []) {
+    const aliasMatch = (Array.isArray(entry.aliases) ? entry.aliases : []).some(
+      (alias) => {
+        const normalizedAlias = normalizeArabic(String(alias || ""));
+        return (
+          normalizedAlias &&
+          (normalizedValue === normalizedAlias ||
+            normalizedValue.includes(normalizedAlias) ||
+            normalizedAlias.includes(normalizedValue))
+        );
+      },
+    );
+
+    if (aliasMatch) {
+      return entry.item;
+    }
+  }
+
+  return "";
+}
+
 function buildArchitecturalChecklistFallback(itemText, context) {
   const normalizedItem = normalizeArabic(itemText);
+  const normalizedSetbacks = normalizeArabic("الارتدادات النظامية");
   const normalizedBuildingRatio = normalizeArabic("نسبة البناء");
+  const normalizedFloorHeight = normalizeArabic("عدد الأدوار والارتفاع");
+  const normalizedRoomSpaces = normalizeArabic("مساحات الغرف والفراغات");
   const normalizedParking = normalizeArabic("مواقف السيارات");
+  const normalizedUsage = normalizeArabic("الاستخدام مطابق للتصنيف");
   const normalizedAccessibility = normalizeArabic("متطلبات ذوي الإعاقة");
 
   let evidenceTerms = [];
   let matchedComment = "";
 
-  if (normalizedItem === normalizedBuildingRatio) {
+  if (normalizedItem === normalizedSetbacks) {
+    evidenceTerms = [
+      "الارتدادات النظامية",
+      "الارتدادات",
+      "الارتداد",
+      "setback",
+      "setbacks",
+    ].map((term) => normalizeArabic(term));
+  } else if (normalizedItem === normalizedBuildingRatio) {
     evidenceTerms = [
       "نسبة البناء",
       "نسبه البناء",
@@ -1320,6 +1742,67 @@ function buildArchitecturalChecklistFallback(itemText, context) {
       "مساحات البناء",
       "building ratio",
       "coverage ratio",
+    ].map((term) => normalizeArabic(term));
+  } else if (normalizedItem === normalizedFloorHeight) {
+    evidenceTerms = [
+      "عدد الأدوار",
+      "عدد الادوار",
+      "عدد الطوابق",
+      "الأدوار",
+      "الادوار",
+      "الطوابق",
+      "الدور الأرضي",
+      "الدور الارضي",
+      "الدور الأول",
+      "الدور الاول",
+      "الدور الثاني",
+      "الدور الثالث",
+      "دور أرضي",
+      "دور أول",
+      "دور ثاني",
+      "دور ثالث",
+      "ارتفاع المبنى",
+      "ارتفاع",
+      "مناسيب",
+      "منسوب",
+      "section",
+      "elevation",
+      "مقطع",
+      "floors",
+      "storeys",
+      "stories",
+    ].map((term) => normalizeArabic(term));
+  } else if (normalizedItem === normalizedRoomSpaces) {
+    evidenceTerms = [
+      "مساحات الغرف",
+      "مساحات",
+      "الفراغات الداخلية",
+      "الفراغات",
+      "توزيع الغرف",
+      "توزيع الفراغات",
+      "جدول الغرف",
+      "جدول الفراغات",
+      "جدول الفراغات الداخلية",
+      "غرف النوم",
+      "غرفة النوم",
+      "صالة",
+      "مجلس",
+      "مطبخ",
+      "دورة مياه",
+      "حمام",
+      "غرفة",
+      "غرف",
+      "الفراغات",
+      "room schedule",
+      "room schedules",
+      "room spaces",
+      "room plan",
+      "room plans",
+      "schedule of rooms",
+      "internal spaces",
+      "space schedule",
+      "dimensions",
+      "ابعاد",
     ].map((term) => normalizeArabic(term));
   } else if (normalizedItem === normalizedParking) {
     evidenceTerms = [
@@ -1346,6 +1829,28 @@ function buildArchitecturalChecklistFallback(itemText, context) {
       "منحدر سيارات",
       "كراج",
     ].map((term) => normalizeArabic(term));
+  } else if (normalizedItem === normalizedUsage) {
+    evidenceTerms = [
+      "الاستخدام مطابق للتصنيف",
+      "مطابقة الاستخدام",
+      "تصنيف الاستخدام",
+      "الاستخدام",
+      "التصنيف",
+      "توصيف الاستخدام",
+      "نوع الاستخدام",
+      "وصف الاستخدام",
+      "occupancy",
+      "usage",
+      "سكني",
+      "تجاري",
+      "فيلا",
+      "شقق",
+      "مبنى سكني",
+      "مبنى تجاري",
+      "استعمال",
+      "السكني",
+      "التجاري",
+    ].map((term) => normalizeArabic(term));
   } else if (normalizedItem.includes(normalizedAccessibility)) {
     evidenceTerms = [
       "ذوي الإعاقة",
@@ -1354,21 +1859,15 @@ function buildArchitecturalChecklistFallback(itemText, context) {
       "اعاقة",
       "كرسي متحرك",
       "wheelchair",
-      "accessible",
-      "accessibility",
       "منحدر ذوي الإعاقة",
       "منحدر ذوي الاعاقة",
       "رامب ذوي الإعاقة",
       "رامب ذوي الاعاقة",
-      "ramp accessible",
       "accessible ramp",
       "دورة مياه لذوي الإعاقة",
       "دورة مياه لذوي الاعاقة",
       "حمام ذوي الإعاقة",
       "حمام ذوي الاعاقة",
-      "مصعد",
-      "elevator",
-      "lift",
       "disabled parking",
       "accessible parking",
     ].map((term) => normalizeArabic(term));
@@ -1390,6 +1889,17 @@ function buildArchitecturalChecklistFallback(itemText, context) {
   const sourceRefs = Array.from(
     new Set(evidenceSources.map((source) => source.sourceRef).filter(Boolean)),
   ).slice(0, 4);
+  const setbackEvidence = evidenceSources.some((source) => {
+    const normalizedSourceText = normalizeArabic(source.text);
+    return [
+      normalizeArabic("الارتدادات النظامية"),
+      normalizeArabic("الارتدادات"),
+      normalizeArabic("الارتداد"),
+      normalizeArabic("الارتادات"),
+      normalizeArabic("setback"),
+      normalizeArabic("setbacks"),
+    ].some((term) => normalizedSourceText.includes(term));
+  });
   const areaScheduleEvidence = evidenceSources.some((source) =>
     normalizeArabic(source.text).includes(normalizeArabic("جدول المساحات")),
   );
@@ -1406,31 +1916,40 @@ function buildArchitecturalChecklistFallback(itemText, context) {
     ].some((term) => normalizedSourceText.includes(term));
   });
   const accessibilityEvidence = evidenceSources.some((source) => {
-    const normalizedSourceText = normalizeArabic(source.text);
-    return [
-      normalizeArabic("ذوي الإعاقة"),
-      normalizeArabic("ذوي الاعاقة"),
-      normalizeArabic("كرسي متحرك"),
-      normalizeArabic("wheelchair"),
-      normalizeArabic("accessible"),
-      normalizeArabic("منحدر ذوي الإعاقة"),
-      normalizeArabic("منحدر ذوي الاعاقة"),
-      normalizeArabic("دورة مياه لذوي الإعاقة"),
-      normalizeArabic("دورة مياه لذوي الاعاقة"),
-      normalizeArabic("accessible ramp"),
-      normalizeArabic("disabled parking"),
-      normalizeArabic("accessible parking"),
-    ].some((term) => normalizedSourceText.includes(term));
+    return hasPositiveArchitecturalTerm(source.text, [
+      "ذوي الإعاقة",
+      "ذوي الاعاقة",
+      "كرسي متحرك",
+      "wheelchair",
+      "accessible",
+      "منحدر ذوي الإعاقة",
+      "منحدر ذوي الاعاقة",
+      "دورة مياه لذوي الإعاقة",
+      "دورة مياه لذوي الاعاقة",
+      "accessible ramp",
+      "disabled parking",
+      "accessible parking",
+    ]);
   });
 
-  if (normalizedItem === normalizedBuildingRatio) {
+  if (normalizedItem === normalizedSetbacks) {
+    matchedComment = setbackEvidence
+      ? "تظهر الارتدادات النظامية بوضوح في اللوحات المتاحة."
+      : "تم رصد مؤشر صريح على الارتدادات النظامية داخل الملف أو الملفات الحالية.";
+  } else if (normalizedItem === normalizedBuildingRatio) {
     matchedComment = areaScheduleEvidence
       ? "تم رصد جدول المساحات ويُستخدم كمرجع مباشر للتحقق من نسبة البناء في الملف أو الملفات الحالية."
       : "تم رصد مؤشر صريح على نسبة البناء داخل الملف أو الملفات الحالية.";
+  } else if (normalizedItem === normalizedFloorHeight) {
+    matchedComment = "تم رصد عدد الأدوار أو الارتفاع أو مؤشرات مثل منسوب أو مقطع بشكل صريح داخل الملف أو الملفات الحالية.";
+  } else if (normalizedItem === normalizedRoomSpaces) {
+    matchedComment = "تم رصد مساحات الغرف والفراغات أو جدول الغرف أو توصيف قريب للفراغات بشكل صريح داخل الملف أو الملفات الحالية.";
   } else if (normalizedItem === normalizedParking) {
     matchedComment = parkingLayoutEvidence
       ? "تم رصد توزيع أو رموز مواقف سيارات داخل المخطط ويُعتمد ذلك كدليل على تحقق بند مواقف السيارات حتى لو لم يظهر العنوان نصاً."
       : "تم رصد مؤشر صريح على مواقف السيارات داخل الملف أو الملفات الحالية.";
+  } else if (normalizedItem === normalizedUsage) {
+    matchedComment = "تم رصد الاستخدام أو توصيف الاستخدام أو نوعه بشكل صريح داخل الملف أو الملفات الحالية.";
   } else {
     matchedComment = accessibilityEvidence
       ? "تم رصد متطلبات واضحة لذوي الإعاقة داخل المخطط، لذلك يمكن ذكر هذا البند لأنه ظاهر في الملف الحالي."
@@ -1445,14 +1964,11 @@ function buildArchitecturalChecklistFallback(itemText, context) {
   };
 }
 
-function requiresExplicitArchitecturalEvidence(itemText) {
-  return normalizeArabic(itemText).includes(
-    normalizeArabic("متطلبات ذوي الإعاقة"),
-  );
-}
-
 function buildChecklistRows(parsedRows, context) {
   const rowsByItem = new Map();
+  const guidance = buildArchitecturalChecklistGuidance(
+    context.notesForCheckItems,
+  );
 
   (Array.isArray(parsedRows) ? parsedRows : []).forEach((row) => {
     const itemText = normalizeText(row?.item, 220);
@@ -1460,18 +1976,15 @@ function buildChecklistRows(parsedRows, context) {
       return;
     }
 
-    rowsByItem.set(normalizeArabic(itemText), {
-      item: itemText,
-      status:
-        row?.status === "Compliant" ||
-        row?.status === "Non-Compliant" ||
-        row?.status === "Not Found"
-          ? row.status
-          : "Not Found",
+    const canonicalItem =
+      findArchitecturalChecklistKey(itemText, guidance) || itemText;
+
+    rowsByItem.set(normalizeArabic(canonicalItem), {
+      item: canonicalItem,
+      status: normalizeAttachmentChecklistStatus(row?.status),
       comment:
         normalizeText(row?.comment, 320) ||
-        "لم يتم العثور على دليل صريح لهذا البند داخل الملفات الحالية.",
-      sourceRefs: normalizeStringList(row?.sourceRefs, 4),
+        "لم يتم العثور على دليل صريح لهذا البند داخل الملف الحالي.",
     });
   });
 
@@ -1480,45 +1993,104 @@ function buildChecklistRows(parsedRows, context) {
   ).map((itemText) => {
     const matched = rowsByItem.get(normalizeArabic(itemText));
     const fallback = buildArchitecturalChecklistFallback(itemText, context);
-    const requiresExplicitEvidence =
-      requiresExplicitArchitecturalEvidence(itemText);
+    const strongEvidence = hasArchitecturalSemanticEvidence(itemText, context);
+
+    if (
+      matched &&
+      normalizeArabic(itemText).includes(
+        normalizeArabic("متطلبات ذوي الإعاقة"),
+      ) &&
+      !strongEvidence
+    ) {
+      return {
+        item: itemText,
+        status: "Not Found",
+        comment: "لم يتم العثور على دليل صريح لهذا البند داخل الملف الحالي.",
+        sourceRefs: [context.notesForCheckPath].filter(Boolean),
+      };
+    }
 
     if (matched && matched.status !== "Not Found") {
-      if (requiresExplicitEvidence && !fallback) {
-        return {
-          item: itemText,
-          status: "Not Found",
-          comment: "لا يتم ذكر هذا البند إلا إذا ظهر صراحة داخل الملف الحالي.",
-          sourceRefs: [context.notesForCheckPath].filter(Boolean),
-        };
-      }
+      return {
+        ...matched,
+        sourceRefs: [context.notesForCheckPath].filter(Boolean),
+      };
+    }
 
-      if (
-        fallback &&
-        (!Array.isArray(matched.sourceRefs) || matched.sourceRefs.length === 0)
-      ) {
-        return {
-          ...matched,
-          sourceRefs: fallback.sourceRefs,
-        };
-      }
-
-      return matched;
+    if (strongEvidence) {
+      return {
+        item: itemText,
+        status: "Compliant",
+        comment:
+          normalizeText(fallback?.comment, 320) ||
+          "تم العثور على دليل صريح لهذا البند داخل الملف الحالي.",
+        sourceRefs: fallback?.sourceRefs ?? [context.notesForCheckPath].filter(Boolean),
+      };
     }
 
     if (fallback) {
-      return fallback;
+      return {
+        item: fallback.item,
+        status: "Compliant",
+        comment:
+          normalizeText(fallback.comment, 320) ||
+          "تم العثور على دليل صريح لهذا البند داخل الملف الحالي.",
+        sourceRefs: fallback.sourceRefs,
+      };
     }
 
-    return (
-      matched || {
-        item: itemText,
-        status: "Not Found",
-        comment: "لم يتم العثور على دليل صريح لهذا البند داخل الملفات الحالية.",
-        sourceRefs: [context.notesForCheckPath].filter(Boolean),
-      }
-    );
+    return {
+      item: itemText,
+      status: "Not Found",
+      comment: "لم يتم العثور على دليل صريح لهذا البند داخل الملف الحالي.",
+      sourceRefs: [context.notesForCheckPath].filter(Boolean),
+    };
   });
+}
+
+function buildArchitecturalValidationSummary(checklistResults) {
+  const results = Array.isArray(checklistResults) ? checklistResults : [];
+  const compliantCount = results.filter(
+    (row) => row.status === "Compliant",
+  ).length;
+  const notFoundCount = results.filter((row) => row.status === "Not Found").length;
+
+  if (compliantCount === 0) {
+    return "تم التعرف على المخططات المعمارية، لكن النص المستخرج لا يكفي لإثبات البنود التفصيلية المطلوبة.";
+  }
+
+  return `تم التعرف على المخططات المعمارية، وظهر ${compliantCount} بنداً بدليل صريح بينما بقي ${notFoundCount} بنداً غير مثبت من النص المستخرج.`;
+}
+
+function buildArchitecturalValidationFeedback(checklistResults) {
+  const results = Array.isArray(checklistResults) ? checklistResults : [];
+  const feedback = [];
+
+  const titleFeedback =
+    "تم التعرف على المخططات المعمارية بشكل واضح من الملف المرفوع.";
+  feedback.push(titleFeedback);
+
+  const highSignalRows = results.filter((row) => row.status === "Compliant");
+  if (highSignalRows.length > 0) {
+    feedback.push(
+      `البنود المثبتة صراحة: ${highSignalRows
+        .slice(0, 4)
+        .map((row) => row.item)
+        .join("، ")}.`,
+    );
+  }
+
+  const missingRows = results.filter((row) => row.status !== "Compliant");
+  if (missingRows.length > 0) {
+    feedback.push(
+      `البنود غير المثبتة بوضوح: ${missingRows
+        .slice(0, 4)
+        .map((row) => row.item)
+        .join("، ")}.`,
+    );
+  }
+
+  return feedback.slice(0, 6);
 }
 
 function buildRequirementsComplianceStatus(checklistRows, context) {
@@ -1959,16 +2531,97 @@ async function buildSourcePreview(sourceReference, resolvedPath) {
 }
 
 function parseModelJson(content) {
-  try {
-    return JSON.parse(content);
-  } catch {
-    const firstBrace = content.indexOf("{");
-    const lastBrace = content.lastIndexOf("}");
-    if (firstBrace >= 0 && lastBrace > firstBrace) {
-      return JSON.parse(content.slice(firstBrace, lastBrace + 1));
-    }
+  const text = String(content || "").trim();
+  if (!text) {
     throw new Error("The model response was not valid JSON.");
   }
+
+  const attempts = [];
+  attempts.push(text);
+
+  const fencedMatch = text.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i);
+  if (fencedMatch?.[1]) {
+    attempts.push(fencedMatch[1].trim());
+  }
+
+  const firstBrace = text.indexOf("{");
+  const lastBrace = text.lastIndexOf("}");
+  if (firstBrace >= 0 && lastBrace > firstBrace) {
+    attempts.push(text.slice(firstBrace, lastBrace + 1).trim());
+  }
+
+  const firstBracket = text.indexOf("[");
+  const lastBracket = text.lastIndexOf("]");
+  if (firstBracket >= 0 && lastBracket > firstBracket) {
+    attempts.push(text.slice(firstBracket, lastBracket + 1).trim());
+  }
+
+  for (const candidate of attempts) {
+    try {
+      return JSON.parse(candidate);
+    } catch {
+      // Try the next candidate.
+    }
+  }
+
+  const scanForJson = (openChar, closeChar) => {
+    const openPositions = [];
+    let inString = false;
+    let escaped = false;
+
+    for (let index = 0; index < text.length; index += 1) {
+      const char = text[index];
+      if (inString) {
+        if (escaped) {
+          escaped = false;
+        } else if (char === "\\") {
+          escaped = true;
+        } else if (char === '"') {
+          inString = false;
+        }
+        continue;
+      }
+
+      if (char === '"') {
+        inString = true;
+        continue;
+      }
+
+      if (char === openChar) {
+        openPositions.push(index);
+        continue;
+      }
+
+      if (char === closeChar && openPositions.length > 0) {
+        const start = openPositions.pop();
+        if (openPositions.length === 0 && start !== undefined) {
+          return text.slice(start, index + 1);
+        }
+      }
+    }
+
+    return "";
+  };
+
+  const scannedObject = scanForJson("{", "}");
+  if (scannedObject) {
+    try {
+      return JSON.parse(scannedObject);
+    } catch {
+      // Fall through to the final error.
+    }
+  }
+
+  const scannedArray = scanForJson("[", "]");
+  if (scannedArray) {
+    try {
+      return JSON.parse(scannedArray);
+    } catch {
+      // Fall through to the final error.
+    }
+  }
+
+  throw new Error("The model response was not valid JSON.");
 }
 
 function normalizeConfidence(value) {
@@ -2583,7 +3236,12 @@ export function createReviewApp(options = {}) {
       "Be conservative and do not claim a required document is present unless the page image or visible labels support it.",
       "Write all user-facing strings in Arabic.",
       "Keep extractedText concise and focused on document names, headings, stamps, and visible sheet titles.",
-      "If architectural-plan pages visually show parking bays, car slots, garage areas, ramps, or a parking layout, mention that evidence in extractedText or notes even when the sheet does not explicitly say parking.",
+      "If architectural-plan pages visually show parking bays, car slots, garage areas, ramps, a parking layout, or a clearly drawn parking area, mention that evidence in extractedText or notes even when the sheet does not explicitly say parking.",
+      "When parking is visible on a page, include the page number and describe the visual cues directly, such as parking bays, stall rows, aisle arrows, car symbols, or parking area labels, even if the title block is unrelated.",
+      "If a page title or table title says جدول الارتدادات, جدول الارتادات, setbacks, or setback table, preserve it as explicit setbacks evidence for the architectural review and include the page number.",
+      "If a sheet shows a table of areas, coverage values, المسطحات, numeric area calculations, or anything that looks like جدول المساحات, preserve it as explicit نسبة البناء evidence even when the OCR title is incomplete.",
+      "If a sheet shows room names, space labels, room partitions, or a floor plan with visible room layout such as صالة, مجلس, مطبخ, غرف, حمام, or نوم, preserve it as explicit مساحات الغرف والفراغات evidence even if the exact table title is not visible.",
+      "If a sheet shows a project use label such as فيلا, سكني, تجاري, الاستخدام السكني, الاستخدام التجاري, or a title near توصيف الاستخدام or نوع الاستخدام, preserve it as explicit الاستخدام مطابق للتصنيف evidence even if the sheet title is abbreviated.",
       "Mention accessibility requirements only when they are clearly shown in the plan, such as wheelchair routes, accessible ramps, accessible toilets, accessibility labels, or dedicated disabled parking. Do not infer them from generic circulation unless the evidence is explicit.",
       "Pay special attention to sheet title blocks and repeated discipline labels such as electrical, structural, mechanical, site plan, safety, and approved building regulation sheets.",
     ].join(" ");
@@ -2595,7 +3253,7 @@ export function createReviewApp(options = {}) {
 
     const userPayload = {
       instruction:
-        "استخرج النصوص والعناوين الظاهرة التي تساعد على التعرف على نوع المستندات داخل الملف الهندسي. راجع كل صفحة مرفقة بصرياً، وركز على خانة عنوان اللوحة، اسم التخصص، الأختام، ورؤوس الجداول. ثم حدد المستندات المطلوبة التي تظهر بوضوح أو بدلالة قوية في الصفحات. إذا ظهر عنوان قريب من اسم المستند المطلوب فارجعه باسم المستند المطلوب نفسه. وإذا أظهرت اللوحة المعمارية مواقف سيارات مرسومة بصرياً أو صفوف مواقف أو كراج أو منحدر سيارات حتى دون عنوان نصي واضح، فاذكر ذلك صراحة داخل extractedText أو notes لأنه دليل مهم لبند مواقف السيارات. أما متطلبات ذوي الإعاقة (إن وجد) فلا تذكرها إلا إذا ظهرت بوضوح مثل منحدر مخصص أو مسار كرسي متحرك أو دورة مياه مخصصة أو وسم صريح لذلك داخل المخطط.",
+        "استخرج النصوص والعناوين الظاهرة التي تساعد على التعرف على نوع المستندات داخل الملف الهندسي. راجع كل صفحة مرفقة بصرياً، وركز على خانة عنوان اللوحة، اسم التخصص، الأختام، ورؤوس الجداول. ثم حدد المستندات المطلوبة التي تظهر بوضوح أو بدلالة قوية في الصفحات. إذا ظهر عنوان قريب من اسم المستند المطلوب فارجعه باسم المستند المطلوب نفسه. وإذا ظهرت عناوين مثل جدول الارتدادات أو جدول الارتادات أو setbacks في أي صفحة، فاعتبرها دليلاً صريحاً على الارتدادات النظامية وأشر إلى رقم الصفحة بوضوح. وإذا أظهرت اللوحة عنواناً أو قيماً أو جدولاً قريباً من جدول المساحات أو المسطحات أو نسبة التغطية أو أي جدول حسابات مساحات، فاعتبر ذلك دليلاً صريحاً على نسبة البناء وأشر إلى رقم الصفحة بوضوح. وإذا أظهرت اللوحة المعمارية مواقف سيارات مرسومة بصرياً أو صفوف مواقف أو كراج أو منحدر سيارات أو منطقة مواقف واضحة حتى دون عنوان نصي واضح، فاذكر ذلك صراحة داخل extractedText أو notes مع رقم الصفحة لأنه دليل مهم لبند مواقف السيارات. وإذا أظهرت اللوحة مساحة الغرف أو توزيع الفراغات أو أسماء الفراغات المعمارية أو مخطط الدور الأرضي/الأول مع صالة ومجلس ومطبخ وغرف نوم أو أي تخطيط داخلي واضح، فاعتبره دليلاً صريحاً على مساحات الغرف والفراغات وأشر إلى رقم الصفحة بوضوح. وإذا أظهر الملف توصيف استخدام مثل فيلا أو سكني أو تجاري أو استخدام سكني أو استخدام تجاري، فاعتبره دليلاً صريحاً على الاستخدام مطابق للتصنيف وأشر إلى رقم الصفحة بوضوح. أما متطلبات ذوي الإعاقة (إن وجد) فلا تذكرها إلا إذا ظهرت بوضوح مثل منحدر مخصص أو مسار كرسي متحرك أو دورة مياه مخصصة أو وسم صريح لذلك داخل المخطط.",
       outputSchema: {
         extractedText: "string",
         detectedDocuments: "string[] subset of requiredDocuments",
@@ -2706,6 +3364,9 @@ export function createReviewApp(options = {}) {
     );
     const architecturalChecklistItems =
       structuredNotesForCheck.architecturalItems;
+    const architecturalChecklistGuidance = buildArchitecturalChecklistGuidance(
+      architecturalChecklistItems,
+    );
     const isArchitecturalPlansValidation =
       isArchitecturalPlansDocumentCandidate(normalizedExpectedDocument) ||
       normalizedRequiredDocuments.some((documentName) =>
@@ -2723,8 +3384,15 @@ export function createReviewApp(options = {}) {
       "passed means the file clearly matches the expected attachment.",
       "warning means the file may be relevant but still has ambiguity, weak evidence, or quality issues.",
       "missing means the file does not appear to match the expected attachment or has no usable evidence.",
-      "If the expected attachment is the architectural plans sheet, evaluate every checklist point provided in the payload and return one result row for each exact item text.",
-      "For the parking checklist item, accept parking evidence reflected in extractedText or notes even if the sheet title does not explicitly mention parking, especially when the source describes drawn parking bays, garage areas, ramps, or visual parking layout.",
+      "If the expected attachment is the architectural plans sheet, evaluate every checklist point provided in the payload and return one result row for each checklist concept using the canonical item text when possible.",
+      "The payload also includes architecturalChecklistGuidance. Treat it as a semantic map of close sheet titles, table names, and drawing labels, not as a strict list of exact-string matches.",
+      "When a table title or extracted note points to a specific item, use that clue directly. For example, treat جدول المساحات as strong evidence for نسبة البناء and treat جدول الارتدادات, جدول الارتادات, or a setbacks table as strong evidence for الارتدادات النظامية.",
+      "Treat room schedule titles such as جدول الغرف, جدول الفراغات, جدول الفراغات الداخلية, room schedule, room plan, and schedule of rooms as strong evidence for مساحات الغرف والفراغات.",
+      "Treat usage labels such as توصيف الاستخدام, نوع الاستخدام, الاستخدام السكني, الاستخدام التجاري, occupancy, and usage as strong evidence for الاستخدام مطابق للتصنيف.",
+      "Also treat floor-plan cues like دور أرضي, دور أول, دور ثاني, منسوب, مقطع, elevation, and section as valid evidence for عدد الأدوار والارتفاع when they clearly indicate the number of floors or the building height.",
+      "Treat room labels and room schedule cues like غرفة, صالة, مجلس, مطبخ, جدول الغرف, and dimensions as valid evidence for مساحات الغرف والفراغات when they describe the internal room layout.",
+      "Treat usage cues like سكني, تجاري, فيلا, شقق, مبنى سكني, مبنى تجاري, and استعمال as valid evidence for الاستخدام مطابق للتصنيف when they clearly indicate the project use.",
+      "For the parking checklist item, accept parking evidence reflected in extractedText or notes even if the sheet title does not explicitly mention parking, especially when the source describes drawn parking bays, garage areas, ramps, parking areas, aisle arrows, car symbols, or visual parking layout. Page-numbered notes are especially helpful when the parking layout appears on a later sheet like page 15.",
       "For the accessibility checklist item, mention it only when there is explicit evidence in the extractedText or notes, such as wheelchair paths, accessibility labels, accessible toilets, accessible ramps, or dedicated disabled parking. If it is not clearly shown, leave it as Not Found.",
       "Be strict and concise. Do not guess.",
       "Write all user-facing strings in Arabic.",
@@ -2732,7 +3400,7 @@ export function createReviewApp(options = {}) {
 
     const userPayload = {
       instruction: isArchitecturalPlansValidation
-        ? "قيّم هذا الملف الواحد فقط. هل يطابق المتطلب المطلوب؟ ثم افحص جميع بنود checklist الخاصة بالمخططات المعمارية الواردة في الحمولة وأخرج status وsummary وfeedback مع checklistResults بحيث يحتوي كل بند على item وstatus وcomment بشكل مباشر وقابل للعرض تحت خانة الرفع. في بند مواقف السيارات اعتبر الوصف الذي يذكر مواقف مرسومة أو صفوف مواقف أو كراج أو منحدر سيارات دليلاً صالحاً حتى لو لم يظهر اسم البند نصاً داخل اللوحة. أما بند متطلبات ذوي الإعاقة (إن وجد) فلا تذكره إلا إذا ظهر صراحة في النص أو الملاحظات المستخرجة مثل منحدر مخصص أو مسار كرسي متحرك أو دورة مياه مخصصة أو وسم واضح لذلك."
+        ? "قيّم هذا الملف الواحد فقط. هل يطابق المتطلب المطلوب؟ ثم افحص جميع بنود checklist الخاصة بالمخططات المعمارية الواردة في الحمولة وأخرج status وsummary وfeedback مع checklistResults بحيث يحتوي كل بند على item وstatus وcomment بشكل مباشر وقابل للعرض تحت خانة الرفع. استخدم الإشارات الجدولية وقراءات اللوحات داخل الملف بذكاء: جدول المساحات دليل قوي على نسبة البناء، وجدول الارتدادات أو جدول الارتادات أو جدول مشابه دليل قوي على الارتدادات النظامية، بينما دور أرضي/دور أول/دور ثاني أو مقطع أو منسوب أو elevation أو section قد تثبت عدد الأدوار والارتفاع، وتوزيع الغرف أو جدول الغرف أو جدول الفراغات أو جدول الفراغات الداخلية أو room schedule أو room plan أو schedule of rooms قد تثبت مساحات الغرف والفراغات، وكلمات مثل سكني أو تجاري أو فيلا أو شقق أو استعمال أو occupancy أو usage أو توصيف الاستخدام أو نوع الاستخدام قد تثبت الاستخدام مطابق للتصنيف. في بند مواقف السيارات اعتبر الوصف الذي يذكر مواقف مرسومة أو صفوف مواقف أو كراج أو منحدر سيارات دليلاً صالحاً حتى لو لم يظهر اسم البند نصاً داخل اللوحة. أما بند متطلبات ذوي الإعاقة (إن وجد) فلا تذكره إلا إذا ظهر صراحة في النص أو الملاحظات المستخرجة مثل منحدر مخصص أو مسار كرسي متحرك أو دورة مياه مخصصة أو وسم واضح لذلك."
         : "قيّم هذا الملف الواحد فقط. هل يطابق المتطلب المطلوب؟ أخرج status وsummary وfeedback بشكل مباشر وقابل للعرض تحت خانة الرفع.",
       outputSchema: {
         status: "passed | warning | missing",
@@ -2758,6 +3426,9 @@ export function createReviewApp(options = {}) {
       },
       architecturalChecklistItems: isArchitecturalPlansValidation
         ? architecturalChecklistItems
+        : [],
+      architecturalChecklistGuidance: isArchitecturalPlansValidation
+        ? architecturalChecklistGuidance
         : [],
     };
 
@@ -2793,8 +3464,20 @@ export function createReviewApp(options = {}) {
               "لم يتم العثور على دليل صريح لهذا البند داخل الملف الحالي.",
           }))
         : [];
+      const hasVerifiedArchitecturalEvidence =
+        checklistResults.some((row) => row.status === "Compliant");
+      const responseSummary = isArchitecturalPlansValidation
+        ? hasVerifiedArchitecturalEvidence
+          ? modelSummary
+          : buildArchitecturalValidationSummary(checklistResults)
+        : modelSummary;
+      const responseFeedback = isArchitecturalPlansValidation
+        ? hasVerifiedArchitecturalEvidence
+          ? modelFeedback
+          : buildArchitecturalValidationFeedback(checklistResults)
+        : modelFeedback;
 
-      if (!modelSummary || modelFeedback.length === 0) {
+      if (!responseSummary || responseFeedback.length === 0) {
         return res.status(502).json({
           error:
             "AI validation response was incomplete. The model did not return usable feedback for this file.",
@@ -2804,8 +3487,8 @@ export function createReviewApp(options = {}) {
       return res.json({
         model,
         status: normalizeAttachmentValidationStatus(parsed.status),
-        summary: modelSummary,
-        feedback: modelFeedback,
+        summary: responseSummary,
+        feedback: responseFeedback,
         confidence: normalizeConfidence(parsed.confidence),
         ...(checklistResults.length > 0 ? { checklistResults } : {}),
       });

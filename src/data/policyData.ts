@@ -65,7 +65,7 @@ const schoolIssueDocuments = [
 export const unifiedGuideProjectTypes: ProjectTypeGroup[] = [
   {
     id: "residential-buildings",
-    title: "اشتراطات المباني السكنية",
+    title: " المباني السكنية",
     sourceCode: "1",
     subtypes: [
       {
@@ -90,7 +90,7 @@ export const unifiedGuideProjectTypes: ProjectTypeGroup[] = [
   },
   {
     id: "mid-rise-buildings",
-    title: "اشتراطات العمائر",
+    title: "العمائر",
     sourceCode: "2",
     subtypes: [
       {
@@ -121,7 +121,7 @@ export const unifiedGuideProjectTypes: ProjectTypeGroup[] = [
   },
   {
     id: "commercial-projects",
-    title: "اشتراطات المشاريع التجارية",
+    title: "المشاريع التجارية",
     sourceCode: "3",
     subtypes: [
       {
@@ -138,67 +138,67 @@ export const unifiedGuideProjectTypes: ProjectTypeGroup[] = [
       },
       {
         id: "schools",
-        title: "اشتراطات المدارس",
+        title: " المدارس",
         sourceCode: "3:3",
         requiredDocuments: schoolIssueDocuments,
       },
       {
         id: "wedding-halls",
-        title: "اشتراطات قاعات (قصور الأفراح)",
+        title: "قاعات (قصور الأفراح)",
         sourceCode: "3:4",
         requiredDocuments: commercialProjectIssueDocuments,
       },
       {
         id: "chalets-resthouses",
-        title: "اشتراطات الاستراحات (الشاليهات)",
+        title: " الاستراحات (الشاليهات)",
         sourceCode: "3:5",
         requiredDocuments: commercialProjectIssueDocuments,
       },
       {
         id: "car-showrooms",
-        title: "اشتراطات معارض السيارات",
+        title: " معارض السيارات",
         sourceCode: "3:6",
         requiredDocuments: commercialProjectIssueDocuments,
       },
       {
         id: "building-material-centers",
-        title: "اشتراطات مراكز بيع مواد البناء",
+        title: " مراكز بيع مواد البناء",
         sourceCode: "3:7",
         requiredDocuments: commercialProjectIssueDocuments,
       },
       {
         id: "gas-cylinder-centers",
-        title: "اشتراطات مراكز بيع أسطوانات الغاز",
+        title: " مراكز بيع أسطوانات الغاز",
         sourceCode: "3:8",
         requiredDocuments: commercialProjectIssueDocuments,
       },
       {
         id: "warehouses",
-        title: "اشتراطات المستودعات",
+        title: " المستودعات",
         sourceCode: "3:9",
         requiredDocuments: commercialProjectIssueDocuments,
       },
       {
         id: "storage-facilities",
-        title: "اشتراطات المخازن",
+        title: " المخازن",
         sourceCode: "3:10",
         requiredDocuments: commercialProjectIssueDocuments,
       },
       {
         id: "self-storage-units",
-        title: "اشتراطات وحدات التخزين الذاتي",
+        title: " وحدات التخزين الذاتي",
         sourceCode: "3:11",
         requiredDocuments: commercialProjectIssueDocuments,
       },
       {
         id: "workshops",
-        title: "اشتراطات الورش",
+        title: " الورش",
         sourceCode: "3:12",
         requiredDocuments: commercialProjectIssueDocuments,
       },
       {
         id: "hypermarkets",
-        title: "اشتراطات الأسواق المركزية (هيبر ماركت)",
+        title: " الأسواق المركزية (هيبر ماركت)",
         sourceCode: "3:13",
         requiredDocuments: commercialProjectIssueDocuments,
       },
