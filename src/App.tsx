@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import { useMutation } from "@tanstack/react-query";
-import { policies, defaultPolicyId, emptyForm } from "./data/policyData";
+import { policies, emptyForm } from "./data/policyData";
 import { requestLlmReview } from "./api/llmReview";
 import { fetchJson, resolveApiUrl } from "./api/http";
 import {
@@ -123,7 +123,7 @@ const processSteps = {
 
 function getSubmissionValidationErrors(
   form: SubmissionForm,
-  policy: LicensePolicy,
+  policy: LicensePolicy | null,
 ) {
   const errors: string[] = [];
 
@@ -134,10 +134,12 @@ function getSubmissionValidationErrors(
   if (!form.mobile.trim()) errors.push("رقم الجوال مطلوب.");
   if (!form.district.trim()) errors.push("بيانات الحي مطلوبة.");
   if (!form.plotNumber.trim()) errors.push("رقم القطعة أو المخطط مطلوب.");
-  if ((policy.projectTypes?.length ?? 0) > 0 && !form.projectTypeGroupId) {
+  if (!policy) {
+    errors.push("نوع السياسة مطلوب.");
+  } else if ((policy.projectTypes?.length ?? 0) > 0 && !form.projectTypeGroupId) {
     errors.push("نوع المشروع مطلوب.");
   }
-  if ((policy.projectTypes?.length ?? 0) > 0 && !form.projectSubtypeId) {
+  if (policy && (policy.projectTypes?.length ?? 0) > 0 && !form.projectSubtypeId) {
     errors.push("التصنيف التفصيلي للمشروع مطلوب.");
   }
   if (form.projectDescription.trim().length < 20)
@@ -1566,7 +1568,7 @@ function LlmSupportContent({
 
 export default function App() {
   const [viewMode, setViewMode] = useState<ViewMode>("office");
-  const [policyId, setPolicyId] = useState(defaultPolicyId);
+  const [policyId, setPolicyId] = useState("");
   const [form, setForm] = useState<SubmissionForm>(emptyForm);
   const [applications, setApplications] = useState<ApplicationRecord[]>([]);
   const [selectedApplicationId, setSelectedApplicationId] = useState("");
@@ -1606,18 +1608,20 @@ export default function App() {
     }
   }, []);
 
-  const activePolicy =
-    policies.find((item) => item.id === policyId) ?? policies[0];
+  const selectedPolicy =
+    policies.find((item) => item.id === policyId) ?? null;
+  const activePolicy = selectedPolicy ?? policies[0];
   const activeScopedPolicy = buildPolicyWithResolvedDocuments(
     activePolicy,
     form.projectTypeGroupId,
     form.projectSubtypeId,
   );
-  const activeProjectTypeGroups = getProjectTypeGroups(activePolicy);
-  const activeProjectTypeGroup = getSelectedProjectTypeGroup(
-    activePolicy,
-    form.projectTypeGroupId,
-  );
+  const activeProjectTypeGroups = selectedPolicy
+    ? getProjectTypeGroups(selectedPolicy)
+    : [];
+  const activeProjectTypeGroup = selectedPolicy
+    ? getSelectedProjectTypeGroup(selectedPolicy, form.projectTypeGroupId)
+    : undefined;
   const draftReview = reviewApplication(activeScopedPolicy, form);
   const selectedApplication =
     applications.find((item) => item.id === selectedApplicationId) ??
@@ -1625,18 +1629,21 @@ export default function App() {
     null;
   const submissionValidationErrors = getSubmissionValidationErrors(
     form,
-    activeScopedPolicy,
+    selectedPolicy,
   );
   const requiresProjectSubtypeSelection = activeProjectTypeGroups.length > 0;
   const canUploadFiles =
-    !requiresProjectSubtypeSelection ||
-    Boolean(form.projectTypeGroupId && form.projectSubtypeId);
+    Boolean(selectedPolicy) &&
+    (!requiresProjectSubtypeSelection ||
+      Boolean(form.projectTypeGroupId && form.projectSubtypeId));
   const isAnalyzing = uploadingDocuments.length > 0;
   const hasBulkUploadPreview =
     bulkUploadPreview !== null && bulkUploadPreview.length > 0;
-  const uploadLockMessage = !requiresProjectSubtypeSelection
-    ? ""
-    : !form.projectTypeGroupId
+  const uploadLockMessage = !selectedPolicy
+    ? "اختر نوع السياسة أولاً قبل رفع أي ملف."
+    : !requiresProjectSubtypeSelection
+      ? ""
+      : !form.projectTypeGroupId
       ? "اختر نوع المشروع أولاً قبل رفع أي ملف."
       : !form.projectSubtypeId
         ? "اختر التصنيف التفصيلي للمشروع قبل رفع أي ملف."
@@ -1737,33 +1744,20 @@ export default function App() {
 
   function handlePolicyChange(nextPolicyId: string) {
     const nextPolicy =
-      policies.find((item) => item.id === nextPolicyId) ?? policies[0];
-    const defaultProjectTypeGroupId = nextPolicy.projectTypes?.[0]?.id ?? "";
-    const defaultProjectSubtypeId =
-      nextPolicy.projectTypes?.[0]?.subtypes?.[0]?.id ?? "";
-    setPolicyId(nextPolicy.id);
+      policies.find((item) => item.id === nextPolicyId) ?? null;
+    setPolicyId(nextPolicy?.id ?? "");
     draftLlmMutation.reset();
     setSubmitError("");
     clearBulkUploadPreview();
     setForm((current) => ({
       ...current,
-      projectTypeGroupId: defaultProjectTypeGroupId,
-      projectSubtypeId: defaultProjectSubtypeId,
-      selectedDocuments: collectDetectedDocuments(
-        current.uploadedAttachments,
-        buildPolicyWithResolvedDocuments(
-          nextPolicy,
-          defaultProjectTypeGroupId,
-          defaultProjectSubtypeId,
-        ),
-      ),
+      projectTypeGroupId: "",
+      projectSubtypeId: "",
+      selectedDocuments: [],
     }));
   }
 
   function handleProjectTypeGroupChange(nextProjectTypeGroupId: string) {
-    const nextProjectSubtypeId =
-      getSelectedProjectTypeGroup(activePolicy, nextProjectTypeGroupId)
-        ?.subtypes[0]?.id ?? "";
     draftLlmMutation.reset();
     setAnalysisError("");
     setSubmitError("");
@@ -1771,7 +1765,7 @@ export default function App() {
     setForm((current) => ({
       ...current,
       projectTypeGroupId: nextProjectTypeGroupId,
-      projectSubtypeId: nextProjectSubtypeId,
+      projectSubtypeId: "",
       uploadedAttachments: [],
       selectedDocuments: [],
     }));
@@ -2307,7 +2301,7 @@ export default function App() {
               </h1>
               <div className="hero-tag-row">
                 <span className="brand-badge">استقبال ومراجعة الطلبات</span>
-                <span className="eyebrow">تشغيل موحد لفرق المكتب والأمانة</span>
+                <span className="eyebrow">تشغيل موحد لفرق المكاتب الهندسية  والأمانة</span>
               </div>
             </div>
             <div className="hero-logo-shell">
@@ -2380,6 +2374,7 @@ export default function App() {
                 value={policyId}
                 onChange={(event) => handlePolicyChange(event.target.value)}
               >
+                <option value="">اختر نوع السياسة</option>
                 {policies.map((policy) => (
                   <option key={policy.id} value={policy.id}>
                     {policy.title}
@@ -2543,7 +2538,11 @@ export default function App() {
             <div className="panel-subsection">
               <SmartDisclosure
                 title="الملفات المرفوعة ونتيجة الفحص"
-                count={`${form.selectedDocuments.length} / ${activeScopedPolicy.requiredDocuments.length}`}
+                count={
+                  selectedPolicy
+                    ? `${form.selectedDocuments.length} / ${activeScopedPolicy.requiredDocuments.length}`
+                    : "0 / 0"
+                }
                 defaultOpen
               >
                 <div className="review-card compact-note tone-neutral">
@@ -2816,7 +2815,8 @@ export default function App() {
                     </div>
                   </details>
                 ) : null}
-                <div className="attachment-stack">
+                {canUploadFiles ? (
+                  <div className="attachment-stack">
                   {activeScopedPolicy.requiredDocuments.map((documentName) => {
                     const attachment = getAttachmentForRequiredDocument(
                       form.uploadedAttachments,
@@ -3008,7 +3008,13 @@ export default function App() {
                       </article>
                     );
                   })}
-                </div>
+                  </div>
+                ) : (
+                  <div className="empty-attachments">
+                    اختر نوع السياسة ثم نوع المشروع والتصنيف التفصيلي أولاً حتى
+                    تظهر خانات رفع الملفات.
+                  </div>
+                )}
               </SmartDisclosure>
             </div>
 

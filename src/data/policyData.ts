@@ -904,10 +904,6 @@ export const policies: LicensePolicy[] = (
 
 export const defaultPolicyId = policies[0].id;
 
-const defaultProjectTypeGroupId = unifiedGuideProjectTypes[0]?.id ?? "";
-const defaultProjectSubtypeId =
-  unifiedGuideProjectTypes[0]?.subtypes[0]?.id ?? "";
-
 export const emptyForm: SubmissionForm = {
   applicantName: "سلمان بن عبدالله القحطاني",
   nationalId: "1010123456",
@@ -916,8 +912,8 @@ export const emptyForm: SubmissionForm = {
   mobile: "0500000000",
   district: "حي النرجس",
   plotNumber: "12 / 2450",
-  projectTypeGroupId: defaultProjectTypeGroupId,
-  projectSubtypeId: defaultProjectSubtypeId,
+  projectTypeGroupId: "",
+  projectSubtypeId: "",
   projectDescription:
     "إنشاء مبنى سكني جديد ضمن نطاق حضري قائم مع استكمال المخططات والمرفقات النظامية تمهيداً لرفع الطلب واعتماده.",
   selectedDocuments: [],
