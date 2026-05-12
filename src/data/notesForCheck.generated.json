@@ -1,0 +1,76 @@
+{
+  "sourcePath": "src/data/notesForCheck.generated.json",
+  "fileName": "notesForCheck.generated.json",
+  "checklistItems": [
+    {
+      "sheetName": "Checklist",
+      "rowNumber": 1,
+      "section": "تدقيق معماري",
+      "kind": "architectural",
+      "text": "الارتدادات النظامية"
+    },
+    {
+      "sheetName": "Checklist",
+      "rowNumber": 2,
+      "section": "تدقيق معماري",
+      "kind": "architectural",
+      "text": "نسبة البناء"
+    },
+    {
+      "sheetName": "Checklist",
+      "rowNumber": 3,
+      "section": "تدقيق معماري",
+      "kind": "architectural",
+      "text": "عدد الأدوار والارتفاع"
+    },
+    {
+      "sheetName": "Checklist",
+      "rowNumber": 4,
+      "section": "تدقيق معماري",
+      "kind": "architectural",
+      "text": "مواقف السيارات"
+    },
+    {
+      "sheetName": "Checklist",
+      "rowNumber": 5,
+      "section": "تدقيق معماري",
+      "kind": "architectural",
+      "text": "مساحات الغرف والفراغات"
+    },
+    {
+      "sheetName": "Checklist",
+      "rowNumber": 6,
+      "section": "تدقيق معماري",
+      "kind": "architectural",
+      "text": "متطلبات ذوي الإعاقة (إن وجد)"
+    },
+    {
+      "sheetName": "Checklist",
+      "rowNumber": 7,
+      "section": "تدقيق معماري",
+      "kind": "architectural",
+      "text": "الاستخدام مطابق للتصنيف"
+    },
+    {
+      "sheetName": "Checklist",
+      "rowNumber": 8,
+      "section": "مطابقات",
+      "kind": "consistency",
+      "text": "مطابقة الاستخدام بين (الصك . الرخصة السابقة . نظام البناء)"
+    },
+    {
+      "sheetName": "Checklist",
+      "rowNumber": 9,
+      "section": "مطابقات",
+      "kind": "consistency",
+      "text": "مطابقة المساحات بين ( التقرير الفني . المخطط المعماري .النظام الإلكتروني)"
+    },
+    {
+      "sheetName": "Checklist",
+      "rowNumber": 10,
+      "section": "مطابقات",
+      "kind": "consistency",
+      "text": "مراجعه الواجهات المحليه ( كليشه)"
+    }
+  ]
+}

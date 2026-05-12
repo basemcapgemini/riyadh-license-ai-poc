@@ -102,6 +102,7 @@ docker run --rm -p 8787:8787 --env-file .env riyadh-license-ai-poc
 
 - The municipality review endpoint now returns per-sheet validation cards and suggested municipal replies generated from the extracted sheet text itself.
 - The previous deterministic validation remains as a fallback when the AI response is unavailable.
+- The architectural `Notes for Check` checklist is bundled in `src/data/notesForCheck.generated.json`, so local and live deployments use the same checklist rows by default.
 
 ## Implementation notes
 

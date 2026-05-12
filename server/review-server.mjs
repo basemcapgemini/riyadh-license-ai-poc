@@ -5,8 +5,8 @@ import express from "express";
 import dotenv from "dotenv";
 import mammoth from "mammoth";
 import OpenAI from "openai";
-import XLSX from "xlsx";
 import knowledgeBaseJson from "../src/data/policyKnowledgeBase.generated.json" with { type: "json" };
+import notesForCheckJson from "../src/data/notesForCheck.generated.json" with { type: "json" };
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const projectRoot = path.resolve(__dirname, "..");
@@ -21,83 +21,6 @@ const RATE_LIMIT_RETRY_PADDING_MS = 180;
 const DEFAULT_RATE_LIMIT_RETRY_DELAY_MS = 900;
 const MAX_RATE_LIMIT_TOTAL_WAIT_MS = 12 * 60 * 1000;
 const MAX_RATE_LIMIT_TOTAL_ATTEMPTS = 80;
-const DEFAULT_NOTES_FOR_CHECK_PATH = path.join(
-  workspaceRoot,
-  "accelerator",
-  "notes for check (1).xlsx",
-);
-const DEFAULT_NOTES_FOR_CHECK_FALLBACK_ITEMS = [
-  {
-    sheetName: "Checklist",
-    rowNumber: 1,
-    section: "تدقيق معماري",
-    kind: "architectural",
-    text: "الارتدادات النظامية",
-  },
-  {
-    sheetName: "Checklist",
-    rowNumber: 2,
-    section: "تدقيق معماري",
-    kind: "architectural",
-    text: "نسبة البناء",
-  },
-  {
-    sheetName: "Checklist",
-    rowNumber: 3,
-    section: "تدقيق معماري",
-    kind: "architectural",
-    text: "عدد الأدوار والارتفاع",
-  },
-  {
-    sheetName: "Checklist",
-    rowNumber: 4,
-    section: "تدقيق معماري",
-    kind: "architectural",
-    text: "مواقف السيارات",
-  },
-  {
-    sheetName: "Checklist",
-    rowNumber: 5,
-    section: "تدقيق معماري",
-    kind: "architectural",
-    text: "مساحات الغرف والفراغات",
-  },
-  {
-    sheetName: "Checklist",
-    rowNumber: 6,
-    section: "تدقيق معماري",
-    kind: "architectural",
-    text: "متطلبات ذوي الإعاقة (إن وجد)",
-  },
-  {
-    sheetName: "Checklist",
-    rowNumber: 7,
-    section: "تدقيق معماري",
-    kind: "architectural",
-    text: "الاستخدام مطابق للتصنيف",
-  },
-  {
-    sheetName: "Checklist",
-    rowNumber: 8,
-    section: "مطابقات",
-    kind: "consistency",
-    text: "مطابقة الاستخدام بين (الصك . الرخصة السابقة . نظام البناء)",
-  },
-  {
-    sheetName: "Checklist",
-    rowNumber: 9,
-    section: "مطابقات",
-    kind: "consistency",
-    text: "مطابقة المساحات بين ( التقرير الفني . المخطط المعماري .النظام الإلكتروني)",
-  },
-  {
-    sheetName: "Checklist",
-    rowNumber: 10,
-    section: "مطابقات",
-    kind: "consistency",
-    text: "مراجعه الواجهات المحليه ( كليشه)",
-  },
-];
 const AI_TRACKED_DOCUMENTS = [
   "المخططات المعمارية",
   "المخطط الإنشائي",
@@ -566,99 +489,16 @@ function loadKnowledgeBase(root = projectRoot) {
   return knowledgeBaseJson;
 }
 
-function buildFallbackNotesForCheckContext(resolvedPath) {
+function loadNotesForCheckContext() {
+  const checklistItems = Array.isArray(notesForCheckJson.checklistItems)
+    ? notesForCheckJson.checklistItems
+    : [];
+
   return {
-    sourcePath: resolvedPath,
-    fileName: path.basename(resolvedPath),
-    checklistItems: DEFAULT_NOTES_FOR_CHECK_FALLBACK_ITEMS,
+    sourcePath: notesForCheckJson.sourcePath || "src/data/notesForCheck.generated.json",
+    fileName: notesForCheckJson.fileName || "notesForCheck.generated.json",
+    checklistItems,
   };
-}
-
-function loadNotesForCheckContext(
-  workbookPath = process.env.NOTES_FOR_CHECK_SOURCE_PATH ||
-    DEFAULT_NOTES_FOR_CHECK_PATH,
-) {
-  const resolvedPath = path.resolve(workbookPath);
-  if (!existsSync(resolvedPath)) {
-    return buildFallbackNotesForCheckContext(resolvedPath);
-  }
-
-  try {
-    const workbook = XLSX.readFile(resolvedPath, { cellDates: false });
-    const checklistItems = [];
-    const seen = new Set();
-
-    for (const sheetName of workbook.SheetNames) {
-      const worksheet = workbook.Sheets[sheetName];
-      const rows = XLSX.utils.sheet_to_json(worksheet, {
-        header: 1,
-        defval: "",
-        raw: false,
-      });
-
-      let currentSection = "";
-
-      rows.forEach((row, index) => {
-        const cells = Array.isArray(row)
-          ? row.map((cell) => String(cell || "").trim())
-          : [];
-        const values = cells.filter(Boolean);
-        if (values.length === 0) {
-          return;
-        }
-
-        const sectionCandidate = cells[1];
-        if (sectionCandidate && !/^\d+(?:\.\d+)?$/u.test(sectionCandidate)) {
-          currentSection = sectionCandidate;
-        }
-
-        const descriptiveCells = values.filter(
-          (value) =>
-            value !== currentSection && !/^\d+(?:\.\d+)?$/u.test(value),
-        );
-        const itemText = normalizeText(
-          cells[3] || descriptiveCells[descriptiveCells.length - 1],
-          220,
-        );
-        const kind = classifyNotesForCheckItemKind(currentSection, itemText);
-        const normalized = normalizeArabic(`${kind}|${itemText}`);
-        if (
-          !itemText ||
-          itemText === currentSection ||
-          !normalized ||
-          seen.has(normalized) ||
-          /^sheet\s*\d+$/i.test(itemText)
-        ) {
-          return;
-        }
-
-        seen.add(normalized);
-        checklistItems.push({
-          sheetName,
-          rowNumber: index + 1,
-          section: currentSection || sheetName,
-          kind,
-          text: itemText,
-        });
-      });
-    }
-
-    const normalizedContext = {
-      sourcePath: resolvedPath,
-      fileName: path.basename(resolvedPath),
-      checklistItems: checklistItems.slice(0, 220),
-    };
-
-    return normalizedContext.checklistItems.length > 0
-      ? normalizedContext
-      : buildFallbackNotesForCheckContext(resolvedPath);
-  } catch (error) {
-    console.error("Failed to load Notes for Check workbook", {
-      sourcePath: resolvedPath,
-      message: error instanceof Error ? error.message : String(error),
-    });
-    return buildFallbackNotesForCheckContext(resolvedPath);
-  }
 }
 
 function classifyNotesForCheckItemKind(sectionName, itemText) {
