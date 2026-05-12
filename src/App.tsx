@@ -3663,7 +3663,7 @@ export default function App() {
 
                 <div className="review-card compact-card">
                   <SmartDisclosure
-                    title="المسار الإجرائي المقترح للبلدية"
+                    title="المسار الإجرائي للطلب او للمعاملة"
                     count={
                       (
                         policies.find(
