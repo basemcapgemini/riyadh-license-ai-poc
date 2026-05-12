@@ -25,6 +25,7 @@ const AI_TRACKED_DOCUMENTS = [
   "المخططات المعمارية",
   "المخطط الإنشائي",
   "الموقع العام",
+  "صورة الموقع العام",
   "المخطط الكهربائي",
   "مخطط الأمن والسلامة",
   "المخططات الميكانيكية",
@@ -35,13 +36,17 @@ const CHECKLIST_DOCUMENT_CATALOG = {
   "صورة بطاقة الأحوال المدنية": "1",
   "صورة الصك": "2",
   "تقرير مساحي في القطاع مع منسوب": "3",
+  "الرفع المساحي موضحًا المناسيب للشوارع المحيطة": "3",
   "صورة جزئية من المخطط التنظيمي": "4",
   اقرارات: "7",
+  "اقرار من مكتب الهندسي لتحمل مسؤولية الدراسة المعمارية والانشائية والكهربائية والميكانيكية بموجب اتفاقية بين المالك والمكتب الهندسي المصمم والامانة":
+    "7",
   "إيصال سداد الرسوم": "8",
   "نموذج تدقيق نظام اشتراطات": "9",
   "شهادة الإشغال": "15",
   "صورة جزئية للموقع (كروكي)": "16",
   "إقرار المالك بتنفيذ لائحة الضوابط 9": "21",
+  "إقرار المالك بتنفيذ لائحة الضوابط والشروط": "21",
   "تعهد المكتب الهندسي المشرف": "22",
   "صورة رخصة البناء": "24",
   "محضر تجزئة": "26",
@@ -54,13 +59,16 @@ const CHECKLIST_DOCUMENT_CATALOG = {
   "المخططات المعمارية": "48",
   "موافقة التربية والتعليم": "60",
   "تعهد المخلفات": "63",
+  "تعهد إزالة النفايات ونواتج الحفر بالموقع": "63",
   "عقد اشراف": "64",
+  "العقد بين مالك العقار ومقدم الطلب": "64",
   "تقرير دراسة التربة": "69",
   "الرفع المساحي من مكتب هندسي": "70",
   "خطاب توجيه": "76",
   "خطاب موافقة الزراعة": "77",
   "ملاحظات بلدية": "78",
   "الموقع العام": "79",
+  "صورة الموقع العام": "79",
   "محضر لجنة فنية": "80",
   "المخطط المقترح بعد التعديل": "82",
   "تعهد تنفيذ العزل الحراري": "83",
@@ -79,6 +87,7 @@ const CHECKLIST_DOCUMENT_CATALOG = {
   "عقد الإيجار": "118",
   "شهادة تسجيل وقف": "125",
   "تعهد إغلاق فتحات الخزان": "133",
+  "تعهد اغلاق فتحات خزانات المياه تحت الانشاء": "133",
   "نموذج الواجهات": "135",
 };
 
@@ -785,6 +794,23 @@ function normalizeStringList(value, maxItems = 12) {
   return Array.from(
     new Set(value.map((item) => String(item || "").trim()).filter(Boolean)),
   ).slice(0, maxItems);
+}
+
+function normalizeBasicFieldValue(value, maxLength = 120) {
+  return normalizeText(value, maxLength);
+}
+
+function normalizeBasicFieldSet(value) {
+  const source = value && typeof value === "object" ? value : {};
+
+  return {
+    applicantName: normalizeBasicFieldValue(source.applicantName, 120),
+    nationalId: normalizeBasicFieldValue(source.nationalId, 24),
+    officeName: normalizeBasicFieldValue(source.officeName, 120),
+    officeLicense: normalizeBasicFieldValue(source.officeLicense, 48),
+    district: normalizeBasicFieldValue(source.district, 80),
+    plotNumber: normalizeBasicFieldValue(source.plotNumber, 40),
+  };
 }
 
 function normalizeValidationStatus(value) {
@@ -2398,11 +2424,12 @@ function buildDetectionHints(requiredDocuments) {
         ],
       };
     }
-    if (documentName === "الموقع العام") {
+    if (documentName === "الموقع العام" || documentName === "صورة الموقع العام") {
       return {
         documentName,
         aliases: [
           "موقع عام",
+          "صورة الموقع العام",
           "لوحة الموقع العام",
           "مخطط الموقع",
           "مخطط موقع عام",
@@ -3196,6 +3223,7 @@ export function createReviewApp(options = {}) {
       localExtractedText,
       requiredDocuments,
       extractionMode,
+      purpose,
       pageImages,
     } = req.body ?? {};
     if (
@@ -3229,13 +3257,25 @@ export function createReviewApp(options = {}) {
         .json({ error: "At least one valid page image is required." });
     }
 
-    const systemPrompt = [
+    const isBasicFieldExtraction = purpose === "basic-fields";
+
+    const systemPrompt = isBasicFieldExtraction
+      ? [
+          "You extract the basic request fields from a deed or property ownership image for Riyadh Municipality.",
+          "Respond only with valid JSON.",
+          "Return only the structured basicFields object and nothing else.",
+          "Use the image as the source of truth and the local OCR text only as support.",
+          "Prefer exact label-value pairs from the image.",
+          "Write all user-facing strings in Arabic.",
+        ].join(" ")
+      : [
       "You extract visible document titles and key labels from uploaded engineering permit attachments for Riyadh Municipality.",
       "Respond only with valid JSON.",
       "Use the local extracted text as weak prior context, but correct it using the page images when the OCR is incomplete.",
       "Be conservative and do not claim a required document is present unless the page image or visible labels support it.",
       "Write all user-facing strings in Arabic.",
       "Keep extractedText concise and focused on document names, headings, stamps, and visible sheet titles.",
+      "If the file is a deed or property ownership image, also extract the clearly visible basic request fields when present, especially applicant name, national ID or registry number, office name, office license number, district, and plot number.",
       "If architectural-plan pages visually show parking bays, car slots, garage areas, ramps, a parking layout, or a clearly drawn parking area, mention that evidence in extractedText or notes even when the sheet does not explicitly say parking.",
       "When parking is visible on a page, include the page number and describe the visual cues directly, such as parking bays, stall rows, aisle arrows, car symbols, or parking area labels, even if the title block is unrelated.",
       "If a page title or table title says جدول الارتدادات, جدول الارتادات, setbacks, or setback table, preserve it as explicit setbacks evidence for the architectural review and include the page number.",
@@ -3244,31 +3284,49 @@ export function createReviewApp(options = {}) {
       "If a sheet shows a project use label such as فيلا, سكني, تجاري, الاستخدام السكني, الاستخدام التجاري, or a title near توصيف الاستخدام or نوع الاستخدام, preserve it as explicit الاستخدام مطابق للتصنيف evidence even if the sheet title is abbreviated.",
       "Mention accessibility requirements only when they are clearly shown in the plan, such as wheelchair routes, accessible ramps, accessible toilets, accessibility labels, or dedicated disabled parking. Do not infer them from generic circulation unless the evidence is explicit.",
       "Pay special attention to sheet title blocks and repeated discipline labels such as electrical, structural, mechanical, site plan, safety, and approved building regulation sheets.",
-    ].join(" ");
+      ].join(" ");
 
     const normalizedRequiredDocuments = normalizeStringList(
       requiredDocuments,
       40,
     );
 
-    const userPayload = {
-      instruction:
-        "استخرج النصوص والعناوين الظاهرة التي تساعد على التعرف على نوع المستندات داخل الملف الهندسي. راجع كل صفحة مرفقة بصرياً، وركز على خانة عنوان اللوحة، اسم التخصص، الأختام، ورؤوس الجداول. ثم حدد المستندات المطلوبة التي تظهر بوضوح أو بدلالة قوية في الصفحات. إذا ظهر عنوان قريب من اسم المستند المطلوب فارجعه باسم المستند المطلوب نفسه. وإذا ظهرت عناوين مثل جدول الارتدادات أو جدول الارتادات أو setbacks في أي صفحة، فاعتبرها دليلاً صريحاً على الارتدادات النظامية وأشر إلى رقم الصفحة بوضوح. وإذا أظهرت اللوحة عنواناً أو قيماً أو جدولاً قريباً من جدول المساحات أو المسطحات أو نسبة التغطية أو أي جدول حسابات مساحات، فاعتبر ذلك دليلاً صريحاً على نسبة البناء وأشر إلى رقم الصفحة بوضوح. وإذا أظهرت اللوحة المعمارية مواقف سيارات مرسومة بصرياً أو صفوف مواقف أو كراج أو منحدر سيارات أو منطقة مواقف واضحة حتى دون عنوان نصي واضح، فاذكر ذلك صراحة داخل extractedText أو notes مع رقم الصفحة لأنه دليل مهم لبند مواقف السيارات. وإذا أظهرت اللوحة مساحة الغرف أو توزيع الفراغات أو أسماء الفراغات المعمارية أو مخطط الدور الأرضي/الأول مع صالة ومجلس ومطبخ وغرف نوم أو أي تخطيط داخلي واضح، فاعتبره دليلاً صريحاً على مساحات الغرف والفراغات وأشر إلى رقم الصفحة بوضوح. وإذا أظهر الملف توصيف استخدام مثل فيلا أو سكني أو تجاري أو استخدام سكني أو استخدام تجاري، فاعتبره دليلاً صريحاً على الاستخدام مطابق للتصنيف وأشر إلى رقم الصفحة بوضوح. أما متطلبات ذوي الإعاقة (إن وجد) فلا تذكرها إلا إذا ظهرت بوضوح مثل منحدر مخصص أو مسار كرسي متحرك أو دورة مياه مخصصة أو وسم صريح لذلك داخل المخطط.",
-      outputSchema: {
-        extractedText: "string",
-        detectedDocuments: "string[] subset of requiredDocuments",
-        notes: "string[]",
-        confidence: "number 0-100",
-      },
-      file: {
-        fileName,
-        mimeType: typeof mimeType === "string" ? mimeType : "",
-        localExtractedText: normalizeText(localExtractedText, 5000),
-        requiredDocuments: normalizedRequiredDocuments,
-        detectionHints: buildDetectionHints(normalizedRequiredDocuments),
-      },
-      pages: sanitizedImages.map(({ pageNumber }) => ({ pageNumber })),
-    };
+    const userPayload = isBasicFieldExtraction
+      ? {
+          instruction:
+            "استخرج فقط الحقول الأساسية الظاهرة من صورة الصك أو وثيقة التملك: اسم المستفيد، الهوية / السجل، المكتب الهندسي، رقم ترخيص المكتب، الحي، رقم القطعة / المخطط. إذا لم يظهر حقل بوضوح فاتركه فارغاً. لا تضف أي شرح.",
+          outputSchema: {
+            basicFields:
+              "object<{applicantName:string, nationalId:string, officeName:string, officeLicense:string, district:string, plotNumber:string}>",
+          },
+          file: {
+            fileName,
+            mimeType: typeof mimeType === "string" ? mimeType : "",
+            localExtractedText: normalizeText(localExtractedText, 5000),
+            requiredDocuments: normalizedRequiredDocuments,
+          },
+          pages: sanitizedImages.map(({ pageNumber }) => ({ pageNumber })),
+        }
+      : {
+          instruction:
+            "استخرج النصوص والعناوين الظاهرة التي تساعد على التعرف على نوع المستندات داخل الملف الهندسي. راجع كل صفحة مرفقة بصرياً، وركز على خانة عنوان اللوحة، اسم التخصص، الأختام، ورؤوس الجداول. ثم حدد المستندات المطلوبة التي تظهر بوضوح أو بدلالة قوية في الصفحات. إذا ظهر عنوان قريب من اسم المستند المطلوب فارجعه باسم المستند المطلوب نفسه. وإذا ظهرت عناوين مثل جدول الارتدادات أو جدول الارتادات أو setbacks في أي صفحة، فاعتبرها دليلاً صريحاً على الارتدادات النظامية وأشر إلى رقم الصفحة بوضوح. وإذا أظهرت اللوحة عنواناً أو قيماً أو جدولاً قريباً من جدول المساحات أو المسطحات أو نسبة التغطية أو أي جدول حسابات مساحات، فاعتبر ذلك دليلاً صريحاً على نسبة البناء وأشر إلى رقم الصفحة بوضوح. وإذا أظهرت اللوحة المعمارية مواقف سيارات مرسومة بصرياً أو صفوف مواقف أو كراج أو منحدر سيارات أو منطقة مواقف واضحة حتى دون عنوان نصي واضح، فاذكر ذلك صراحة داخل extractedText أو notes مع رقم الصفحة لأنه دليل مهم لبند مواقف السيارات. وإذا أظهرت اللوحة مساحة الغرف أو توزيع الفراغات أو أسماء الفراغات المعمارية أو مخطط الدور الأرضي/الأول مع صالة ومجلس ومطبخ وغرف نوم أو أي تخطيط داخلي واضح، فاعتبره دليلاً صريحاً على مساحات الغرف والفراغات وأشر إلى رقم الصفحة بوضوح. وإذا أظهر الملف توصيف استخدام مثل فيلا أو سكني أو تجاري أو استخدام سكني أو استخدام تجاري، فاعتبره دليلاً صريحاً على الاستخدام مطابق للتصنيف وأشر إلى رقم الصفحة بوضوح. أما متطلبات ذوي الإعاقة (إن وجد) فلا تذكرها إلا إذا ظهرت بوضوح مثل منحدر مخصص أو مسار كرسي متحرك أو دورة مياه مخصصة أو وسم صريح لذلك داخل المخطط.",
+          outputSchema: {
+            extractedText: "string",
+            detectedDocuments: "string[] subset of requiredDocuments",
+            notes: "string[]",
+            confidence: "number 0-100",
+            basicFields:
+              "object<{applicantName:string, nationalId:string, officeName:string, officeLicense:string, district:string, plotNumber:string}>",
+          },
+          file: {
+            fileName,
+            mimeType: typeof mimeType === "string" ? mimeType : "",
+            localExtractedText: normalizeText(localExtractedText, 5000),
+            requiredDocuments: normalizedRequiredDocuments,
+            detectionHints: buildDetectionHints(normalizedRequiredDocuments),
+          },
+          pages: sanitizedImages.map(({ pageNumber }) => ({ pageNumber })),
+        };
 
     const messages = [
       { role: "system", content: systemPrompt },
@@ -3299,15 +3357,22 @@ export function createReviewApp(options = {}) {
       });
 
       const { model, parsed } = completion;
+      const basicFields = normalizeBasicFieldSet(parsed.basicFields);
+      const hasBasicFields = Object.values(basicFields).some(Boolean);
       return res.json({
         model,
         confidence: normalizeConfidence(parsed.confidence),
-        extractedText: normalizeText(parsed.extractedText, 5000),
-        detectedDocuments: mapDetectedDocumentsToPolicy(
-          parsed.detectedDocuments,
-          normalizedRequiredDocuments,
-        ),
-        notes: normalizeStringList(parsed.notes, 8),
+        ...(isBasicFieldExtraction
+          ? {}
+          : {
+              extractedText: normalizeText(parsed.extractedText, 5000),
+              detectedDocuments: mapDetectedDocumentsToPolicy(
+                parsed.detectedDocuments,
+                normalizedRequiredDocuments,
+              ),
+              notes: normalizeStringList(parsed.notes, 8),
+            }),
+        ...(hasBasicFields ? { basicFields } : {}),
       });
     } catch (error) {
       const message =
@@ -3380,6 +3445,8 @@ export function createReviewApp(options = {}) {
       "You validate one uploaded engineering permit attachment for Riyadh Municipality.",
       "Respond only with valid JSON.",
       "Your task is to judge whether this single file matches the expected required attachment and give direct feedback for that file.",
+      "Also extract any clearly visible basic request fields from the file when they are present, especially beneficiary name, national ID or registry number, engineering office name, office license number, district, and plot number. Return empty strings when a field is not explicitly visible.",
+      "Prefer exact label-value pairs from the file over inference. Use the OCR text as context, but correct it when the file clearly shows a better value.",
       "Use only these statuses: passed, warning, missing.",
       "passed means the file clearly matches the expected attachment.",
       "warning means the file may be relevant but still has ambiguity, weak evidence, or quality issues.",
@@ -3407,6 +3474,8 @@ export function createReviewApp(options = {}) {
         summary: "string",
         feedback: "string[]",
         confidence: "number 0-100",
+        basicFields:
+          "object<{applicantName:string, nationalId:string, officeName:string, officeLicense:string, district:string, plotNumber:string}>",
         ...(isArchitecturalPlansValidation
           ? {
               checklistResults:
@@ -3447,6 +3516,8 @@ export function createReviewApp(options = {}) {
       const { model, parsed } = completion;
       const modelSummary = normalizeText(parsed.summary, 280);
       const modelFeedback = normalizeStringList(parsed.feedback, 6);
+      const basicFields = normalizeBasicFieldSet(parsed.basicFields);
+      const hasBasicFields = Object.values(basicFields).some(Boolean);
       const checklistResults = isArchitecturalPlansValidation
         ? buildChecklistRows(parsed.checklistResults, {
             notesForCheckItems: architecturalChecklistItems,
@@ -3490,6 +3561,7 @@ export function createReviewApp(options = {}) {
         summary: responseSummary,
         feedback: responseFeedback,
         confidence: normalizeConfidence(parsed.confidence),
+        ...(hasBasicFields ? { basicFields } : {}),
         ...(checklistResults.length > 0 ? { checklistResults } : {}),
       });
     } catch (error) {

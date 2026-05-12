@@ -19,6 +19,7 @@ import type {
   AttachmentAnalysisTraceEvent,
   DocumentValidation,
   EvidenceCitation,
+  BasicFormFields,
   LicensePolicy,
   LlmReview,
   SubmissionForm,
@@ -129,8 +130,6 @@ function getSubmissionValidationErrors(
 
   if (!form.applicantName.trim()) errors.push("اسم المستفيد مطلوب.");
   if (!form.nationalId.trim()) errors.push("الهوية أو السجل مطلوب.");
-  if (!form.officeName.trim()) errors.push("اسم المكتب الهندسي مطلوب.");
-  if (!form.officeLicense.trim()) errors.push("رقم ترخيص المكتب مطلوب.");
   if (!form.mobile.trim()) errors.push("رقم الجوال مطلوب.");
   if (!form.district.trim()) errors.push("بيانات الحي مطلوبة.");
   if (!form.plotNumber.trim()) errors.push("رقم القطعة أو المخطط مطلوب.");
@@ -198,6 +197,41 @@ function buildProjectTypeSummary(
 
 function stripFileExtension(fileName: string) {
   return fileName.replace(/\.[^.]+$/u, "");
+}
+
+function isDeedAttachmentCandidate(attachment: UploadedAttachment) {
+  const normalizedName = normalizeArabic(attachment.name);
+  const normalizedDocument = normalizeArabic(attachment.requiredDocument || "");
+  const normalizedExcerpt = normalizeArabic(attachment.excerpt || "");
+  return (
+    normalizedDocument.includes(normalizeArabic("صورة الصك")) ||
+    normalizedName.includes(normalizeArabic("صك")) ||
+    normalizedExcerpt.includes(normalizeArabic("صك"))
+  );
+}
+
+function mergeBasicFormFieldsFromAttachments(attachments: UploadedAttachment[]) {
+  const orderedAttachments = [...attachments].sort((left, right) => {
+    const leftPriority = isDeedAttachmentCandidate(left) ? 0 : 1;
+    const rightPriority = isDeedAttachmentCandidate(right) ? 0 : 1;
+    return leftPriority - rightPriority;
+  });
+
+  const merged: Partial<BasicFormFields> = {};
+  orderedAttachments.forEach((attachment) => {
+    const fields = attachment.basicFields;
+    if (!fields) {
+      return;
+    }
+
+    (Object.keys(fields) as (keyof BasicFormFields)[]).forEach((key) => {
+      if (!merged[key] && fields[key]) {
+        merged[key] = fields[key];
+      }
+    });
+  });
+
+  return merged;
 }
 
 function buildFilenameMatchTerms(documentName: string) {
@@ -448,9 +482,20 @@ function buildDocumentUploadSlotAnalysis(
     };
   }
 
+  if (attachment.basicFields && isDeedAttachmentCandidate(attachment)) {
+    return {
+      status: "passed",
+      summary: "تم استخراج الحقول الأساسية من صورة الصك بنجاح.",
+      note: "تمت تعبئة الحقول الأساسية من الاستخراج الموجه بدلاً من التحليل العام.",
+    };
+  }
+
   return {
     status: "warning",
-    summary: "تعذر استكمال قراءة هذا الملف آلياً في الوقت الحالي.",
+    summary:
+      attachment.extractedText.trim().length > 0
+        ? "تمت قراءة الملف، لكن التحليل التفصيلي ما زال يحتاج تدقيقاً إضافياً."
+        : "تعذر استكمال قراءة هذا الملف آلياً في الوقت الحالي.",
     note: undefined,
   };
 }
@@ -1133,7 +1178,7 @@ function AnalysisTracePanel({
   return (
     <div className="analysis-trace-wrapper">
       <LoadingBanner message={message} icon="ai" />
-      <details className="analysis-trace-panel" open={active}>
+      <details className="analysis-trace-panel">
         <summary>
           <span>سجل المعالجة</span>
           <strong>{events.length}</strong>
@@ -1627,6 +1672,32 @@ export default function App() {
     applications.find((item) => item.id === selectedApplicationId) ??
     applications[0] ??
     null;
+  const extractedBasicFields = mergeBasicFormFieldsFromAttachments(
+    form.uploadedAttachments,
+  );
+  useEffect(() => {
+    setForm((current) => {
+      const extracted = mergeBasicFormFieldsFromAttachments(
+        current.uploadedAttachments,
+      );
+      const nextForm = {
+        ...current,
+        applicantName: extracted.applicantName ?? "",
+        nationalId: extracted.nationalId ?? "",
+        officeName: extracted.officeName ?? "",
+        officeLicense: extracted.officeLicense ?? "",
+        district: extracted.district ?? "",
+        plotNumber: extracted.plotNumber ?? "",
+      };
+
+      return Object.entries(nextForm).every(
+        ([key, value]) => current[key as keyof SubmissionForm] === value,
+      )
+        ? current
+        : nextForm;
+    });
+  }, [form.uploadedAttachments]);
+
   const submissionValidationErrors = getSubmissionValidationErrors(
     form,
     selectedPolicy,
@@ -1734,6 +1805,22 @@ export default function App() {
     draftLlmMutation.reset();
     setSubmitError("");
     setForm((current) => ({ ...current, [field]: value }));
+  }
+
+  function applyBasicFieldsFromAttachments(
+    attachments: UploadedAttachment[],
+    currentForm: SubmissionForm,
+  ) {
+    const extracted = mergeBasicFormFieldsFromAttachments(attachments);
+    return {
+      ...currentForm,
+      applicantName: extracted.applicantName ?? currentForm.applicantName,
+      nationalId: extracted.nationalId ?? currentForm.nationalId,
+      officeName: extracted.officeName ?? currentForm.officeName,
+      officeLicense: extracted.officeLicense ?? currentForm.officeLicense,
+      district: extracted.district ?? currentForm.district,
+      plotNumber: extracted.plotNumber ?? currentForm.plotNumber,
+    };
   }
 
   function clearBulkUploadPreview() {
@@ -1845,14 +1932,14 @@ export default function App() {
           ),
           ...replacement,
         ];
-        return {
+        return applyBasicFieldsFromAttachments(uploadedAttachments, {
           ...current,
           uploadedAttachments,
           selectedDocuments: collectDetectedDocuments(
             uploadedAttachments,
             activeScopedPolicy,
           ),
-        };
+        });
       });
 
       return { ok: true as const };
@@ -2449,37 +2536,39 @@ export default function App() {
                   <label className="field">
                     <span>اسم المستفيد</span>
                     <input
-                      value={form.applicantName}
-                      onChange={(event) =>
-                        updateField("applicantName", event.target.value)
-                      }
+                      value={form.applicantName || extractedBasicFields.applicantName || ""}
+                      readOnly
+                      aria-readonly="true"
+                      placeholder="سيتم استخراجه من المرفقات"
                     />
                   </label>
                   <label className="field">
                     <span>الهوية / السجل</span>
                     <input
-                      value={form.nationalId}
-                      onChange={(event) =>
-                        updateField("nationalId", event.target.value)
-                      }
+                      value={form.nationalId || extractedBasicFields.nationalId || ""}
+                      readOnly
+                      aria-readonly="true"
+                      placeholder="سيتم استخراجه من المرفقات"
                     />
                   </label>
                   <label className="field">
                     <span>المكتب الهندسي</span>
                     <input
-                      value={form.officeName}
+                      value={form.officeName || extractedBasicFields.officeName || ""}
                       onChange={(event) =>
                         updateField("officeName", event.target.value)
                       }
+                      placeholder="اختياري"
                     />
                   </label>
                   <label className="field">
                     <span>رقم ترخيص المكتب</span>
                     <input
-                      value={form.officeLicense}
+                      value={form.officeLicense || extractedBasicFields.officeLicense || ""}
                       onChange={(event) =>
                         updateField("officeLicense", event.target.value)
                       }
+                      placeholder="اختياري"
                     />
                   </label>
                   <label className="field">
@@ -2489,24 +2578,25 @@ export default function App() {
                       onChange={(event) =>
                         updateField("mobile", event.target.value)
                       }
+                      placeholder="0500000000"
                     />
                   </label>
                   <label className="field">
                     <span>الحي</span>
                     <input
-                      value={form.district}
-                      onChange={(event) =>
-                        updateField("district", event.target.value)
-                      }
+                      value={form.district || extractedBasicFields.district || ""}
+                      readOnly
+                      aria-readonly="true"
+                      placeholder="سيتم استخراجه من المرفقات"
                     />
                   </label>
                   <label className="field field-span">
                     <span>رقم القطعة / المخطط</span>
                     <input
-                      value={form.plotNumber}
-                      onChange={(event) =>
-                        updateField("plotNumber", event.target.value)
-                      }
+                      value={form.plotNumber || extractedBasicFields.plotNumber || ""}
+                      readOnly
+                      aria-readonly="true"
+                      placeholder="سيتم استخراجه من المرفقات"
                     />
                   </label>
                 </div>
@@ -2519,6 +2609,7 @@ export default function App() {
                     onChange={(event) =>
                       updateField("projectDescription", event.target.value)
                     }
+                    placeholder="اكتب وصف المشروع هنا"
                   />
                 </label>
 

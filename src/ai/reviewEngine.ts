@@ -54,6 +54,16 @@ const trackedValidationRules: TrackedValidationRule[] = [
     successThreshold: 3,
   },
   {
+    documentName: "صورة الموقع العام",
+    keywordGroups: [
+      ["صورة الموقع العام", "الموقع العام", "site plan"],
+      ["حدود", "حدود الارض", "حدود الأرض"],
+      ["ارتدادات", "ارتداد"],
+      ["مواقف", "موقف سيارات"],
+    ],
+    successThreshold: 3,
+  },
+  {
     documentName: "المخطط الكهربائي",
     keywordGroups: [
       ["مخطط كهربائي", "كهربائي", "لوحة كهرباء"],
@@ -244,7 +254,9 @@ function buildSuggestedResponses(
     (item) => item.documentName === "المخطط الإنشائي",
   );
   const siteValidation = validations.find(
-    (item) => item.documentName === "الموقع العام",
+    (item) =>
+      item.documentName === "الموقع العام" ||
+      item.documentName === "صورة الموقع العام",
   );
   const electricalValidation = validations.find(
     (item) => item.documentName === "المخطط الكهربائي",
@@ -283,6 +295,7 @@ function buildSuggestedResponses(
 
   if (
     missingDocuments.includes("الموقع العام") ||
+    missingDocuments.includes("صورة الموقع العام") ||
     siteValidation?.status === "warning"
   ) {
     responses.push({

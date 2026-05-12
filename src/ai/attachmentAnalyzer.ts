@@ -13,6 +13,7 @@ import type {
   AttachmentAiValidation,
   AttachmentAnalysisTraceEvent,
   AttachmentPreview,
+  BasicFormFields,
   LicensePolicy,
   UploadedAttachment,
 } from "../types";
@@ -1120,9 +1121,195 @@ async function readDocx(file: File): Promise<string> {
   return result.value.slice(0, 12000);
 }
 
+async function loadImageElement(file: File): Promise<HTMLImageElement> {
+  const objectUrl = URL.createObjectURL(file);
+  try {
+    const image = new Image();
+    image.decoding = "async";
+    image.src = objectUrl;
+    if (typeof image.decode === "function") {
+      try {
+        await image.decode();
+      } catch {
+        await new Promise<void>((resolve, reject) => {
+          image.onload = () => resolve();
+          image.onerror = () =>
+            reject(new Error("تعذر تحميل الصورة قبل تشغيل OCR."));
+        });
+      }
+    } else {
+      await new Promise<void>((resolve, reject) => {
+        image.onload = () => resolve();
+        image.onerror = () =>
+          reject(new Error("تعذر تحميل الصورة قبل تشغيل OCR."));
+      });
+    }
+    return image;
+  } finally {
+    URL.revokeObjectURL(objectUrl);
+  }
+}
+
+function applyImageEnhancement(
+  context: CanvasRenderingContext2D,
+  width: number,
+  height: number,
+  mode: "grayscale" | "threshold",
+) {
+  const imageData = context.getImageData(0, 0, width, height);
+  const { data } = imageData;
+  for (let index = 0; index < data.length; index += 4) {
+    const luminance = Math.round(
+      data[index] * 0.299 + data[index + 1] * 0.587 + data[index + 2] * 0.114,
+    );
+    if (mode === "grayscale") {
+      data[index] = luminance;
+      data[index + 1] = luminance;
+      data[index + 2] = luminance;
+    } else {
+      const value = luminance >= 165 ? 255 : 0;
+      data[index] = value;
+      data[index + 1] = value;
+      data[index + 2] = value;
+    }
+  }
+  context.putImageData(imageData, 0, 0);
+}
+
+async function renderImageVariantToDataUrl(
+  file: File,
+  options: {
+    scale?: number;
+    mode?: "original" | "grayscale" | "threshold";
+  } = {},
+): Promise<string> {
+  const { scale = 2, mode = "original" } = options;
+  const image = await loadImageElement(file);
+  const canvas = document.createElement("canvas");
+  const context = canvas.getContext("2d", { willReadFrequently: true });
+  if (!context) {
+    throw new Error("Canvas 2D context is unavailable for image OCR.");
+  }
+
+  canvas.width = Math.max(1, Math.floor(image.naturalWidth * scale));
+  canvas.height = Math.max(1, Math.floor(image.naturalHeight * scale));
+  context.imageSmoothingEnabled = true;
+  context.imageSmoothingQuality = "high";
+  context.drawImage(image, 0, 0, canvas.width, canvas.height);
+
+  if (mode === "grayscale") {
+    applyImageEnhancement(context, canvas.width, canvas.height, "grayscale");
+  } else if (mode === "threshold") {
+    applyImageEnhancement(context, canvas.width, canvas.height, "threshold");
+  }
+
+  return canvas.toDataURL("image/png");
+}
+
+function scoreOcrTextCandidate(text: string): number {
+  const normalized = normalizeExtractedText(text);
+  if (!normalized) {
+    return 0;
+  }
+
+  const semanticHits = [
+    "المالك",
+    "الهوية",
+    "العقار",
+    "المدينة",
+    "الحي",
+    "القطعة",
+    "المخطط",
+    "الوثيقة",
+    "رقم",
+    "سعودي",
+  ].filter((term) => normalizeArabic(normalized).includes(normalizeArabic(term)));
+
+  return normalized.length + semanticHits.length * 180;
+}
+
+function normalizeBasicFields(value: Partial<BasicFormFields> | undefined) {
+  const source = value ?? {};
+  const normalized = {
+    applicantName: String(source.applicantName || "").trim(),
+    nationalId: String(source.nationalId || "").trim(),
+    officeName: String(source.officeName || "").trim(),
+    officeLicense: String(source.officeLicense || "").trim(),
+    district: String(source.district || "").trim(),
+    plotNumber: String(source.plotNumber || "").trim(),
+  };
+
+  return Object.values(normalized).some(Boolean) ? normalized : undefined;
+}
+
+function isLikelyDeedImage(file: File, extractedText: string) {
+  const haystack = normalizeArabic(
+    `${file.name}\n${file.type}\n${extractedText}`,
+  );
+  return haystack.includes(normalizeArabic("صك")) || haystack.includes(normalizeArabic("وثيقة تملك"));
+}
+
+async function extractBasicFieldsFromImage(file: File, extractedText: string) {
+  if (!isLikelyDeedImage(file, extractedText)) {
+    return undefined;
+  }
+
+  try {
+    const pageImages = [
+      {
+        pageNumber: 1,
+        dataUrl: await renderImageVariantToDataUrl(file, {
+          scale: 2,
+          mode: "original",
+        }),
+      },
+    ];
+
+    const extractionResult = await requestAttachmentExtraction({
+      fileName: file.name,
+      mimeType: file.type || "image/*",
+      requiredDocuments: ["صورة الصك"],
+      purpose: "basic-fields",
+      localExtractedText: extractedText,
+      pageImages,
+    });
+
+    return normalizeBasicFields(extractionResult.basicFields);
+  } catch {
+    return undefined;
+  }
+}
+
 async function readImageWithOcr(file: File): Promise<string> {
-  const result = await recognize(file, "ara+eng");
-  return result.data.text.slice(0, 8000);
+  const candidates: string[] = [];
+
+  try {
+    const directResult = await recognize(file, "ara+eng");
+    candidates.push(directResult.data.text || "");
+  } catch {
+    // Ignore the direct pass and continue with preprocessed variants.
+  }
+
+  const variants = [
+    { scale: 2, mode: "original" as const },
+    { scale: 3, mode: "grayscale" as const },
+    { scale: 3, mode: "threshold" as const },
+  ];
+
+  for (const variant of variants) {
+    try {
+      const dataUrl = await renderImageVariantToDataUrl(file, variant);
+      const result = await recognize(dataUrl, "ara+eng");
+      candidates.push(result.data.text || "");
+    } catch {
+      // Continue trying the remaining variants.
+    }
+  }
+
+  const bestCandidate =
+    candidates.sort((left, right) => scoreOcrTextCandidate(right) - scoreOcrTextCandidate(left))[0] ?? "";
+
+  return normalizeExtractedText(bestCandidate).slice(0, 8000);
 }
 
 async function readTextLikeFile(file: File): Promise<string> {
@@ -1140,6 +1327,7 @@ async function extractText(
   detectedDocuments: string[];
   notes: string[];
   aiConfidence?: number;
+  basicFields?: BasicFormFields;
 }> {
   const lowerName = file.name.toLowerCase();
 
@@ -1196,20 +1384,64 @@ async function extractText(
     };
   }
   if (file.type.startsWith("image/")) {
+    const deedLikeImage = isLikelyDeedImage(file, file.name);
     reportProgress({
       operationKey: `ocr-${file.name}`,
       phase: "ocr",
       status: "running",
-      title: `OCR لصورة ${file.name}`,
-      detail: "يتم استخراج النص من الصورة باستخدام OCR محلي.",
+      title: deedLikeImage
+        ? `تحليل مباشر لصورة الصك ${file.name}`
+        : `OCR لصورة ${file.name}`,
+      detail: deedLikeImage
+        ? "يتم إرسال صورة الصك مباشرة إلى نموذج الرؤية لاستخراج البيانات الأساسية بسرعة."
+        : "يتم استخراج النص من الصورة باستخدام OCR محلي.",
       fileName: file.name,
     });
+    if (deedLikeImage) {
+      const extractedText = await readImageWithOcr(file);
+      reportProgress({
+        operationKey: `basic-fields-${file.name}`,
+        phase: "ai",
+        status: "running",
+        title: `استخراج الحقول الأساسية من صورة الصك ${file.name}`,
+        detail:
+          "يتم الآن إرسال صورة الصك إلى نموذج الرؤية لاستخراج اسم المستفيد والهوية والحي ورقم القطعة.",
+        fileName: file.name,
+      });
+      const fastBasicFields = await extractBasicFieldsFromImage(
+        file,
+        extractedText,
+      );
+      reportProgress({
+        operationKey: `basic-fields-${file.name}`,
+        phase: "ai",
+        status: "done",
+        title: `اكتمل استخراج الحقول الأساسية من صورة الصك ${file.name}`,
+        detail:
+          fastBasicFields
+            ? "تم استلام الحقول الأساسية من نموذج الرؤية."
+            : "لم يُرجع نموذج الرؤية حقولاً أساسية واضحة لهذا الملف.",
+        fileName: file.name,
+      });
+      return {
+        sourceType: "image",
+        extractedText,
+        detectedDocuments: [],
+        notes: [],
+        aiConfidence: undefined,
+        basicFields: fastBasicFields,
+      };
+    }
+
+    const extractedText = await readImageWithOcr(file);
+    const basicFields = await extractBasicFieldsFromImage(file, extractedText);
     return {
       sourceType: "image",
-      extractedText: await readImageWithOcr(file),
+      extractedText,
       detectedDocuments: [],
       notes: [],
       aiConfidence: undefined,
+      basicFields,
     };
   }
 
@@ -1256,7 +1488,10 @@ export async function analyzeAttachments(
         detectedDocuments: seededDocuments,
         notes: seededNotes,
         aiConfidence,
+        basicFields: extractedBasicFields,
       } = await extractText(file, policy, reportProgress);
+      const isDeedLikeAttachment =
+        sourceType === "image" && isLikelyDeedImage(file, extractedText);
       const { detectedDocuments, notes } = detectDocuments(
         policy,
         extractedText,
@@ -1278,50 +1513,71 @@ export async function analyzeAttachments(
         detectedDocuments,
       });
 
-      reportProgress({
-        operationKey: `validate-${file.name}`,
-        phase: "ai",
-        status: "running",
-        title: `AI validation for ${file.name}`,
-        detail:
-          "A dedicated AI validation request is being sent for this uploaded file to verify the slot match and return reviewer feedback.",
-        fileName: file.name,
-        detectedDocuments,
-      });
-
       let aiValidation: AttachmentAiValidation | undefined;
+      let basicFields: BasicFormFields | undefined = extractedBasicFields;
       try {
-        const validationResult = await requestAttachmentValidation({
-          fileName: file.name,
-          mimeType: file.type || "application/octet-stream",
-          sourceType,
-          requiredDocuments: policy.requiredDocuments,
-          expectedDocument: policy.requiredDocuments[0],
-          extractedText,
-          detectedDocuments,
-          notes,
-        });
+        if (isDeedLikeAttachment) {
+          reportProgress({
+            operationKey: `validate-${file.name}`,
+            phase: "ai",
+            status: "done",
+            title: `تم تخطي التحقق العام لصورة الصك ${file.name}`,
+            detail:
+              "تم الاعتماد على استخراج الحقول الأساسية مباشرة من صورة الصك لتسريع التعبئة.",
+            fileName: file.name,
+            detectedDocuments,
+          });
+        } else {
+          reportProgress({
+            operationKey: `validate-${file.name}`,
+            phase: "ai",
+            status: "running",
+            title: `AI validation for ${file.name}`,
+            detail:
+              "A dedicated AI validation request is being sent for this uploaded file to verify the slot match and return reviewer feedback.",
+            fileName: file.name,
+            detectedDocuments,
+          });
 
-        aiValidation = {
-          status: validationResult.status,
-          summary: validationResult.summary,
-          feedback: validationResult.feedback,
-          confidence: validationResult.confidence,
-          model: validationResult.model,
-          checklistResults: validationResult.checklistResults,
-        };
+          const validationResult = await requestAttachmentValidation({
+            fileName: file.name,
+            mimeType: file.type || "application/octet-stream",
+            sourceType,
+            requiredDocuments: policy.requiredDocuments,
+            expectedDocument: policy.requiredDocuments[0],
+            extractedText,
+            detectedDocuments,
+            notes,
+          });
 
-        reportProgress({
-          operationKey: `validate-${file.name}`,
-          phase: "ai",
-          status: "done",
-          title: `AI validation completed for ${file.name}`,
-          detail: validationResult.summary,
-          fileName: file.name,
-          detectedDocuments,
-          model: validationResult.model,
-          responseSummary: validationResult.feedback.join(" | ").slice(0, 220),
-        });
+          aiValidation = {
+            status: validationResult.status,
+            summary: validationResult.summary,
+            feedback: validationResult.feedback,
+            confidence: validationResult.confidence,
+            model: validationResult.model,
+            checklistResults: validationResult.checklistResults,
+          };
+
+          const validationBasicFields = normalizeBasicFields(
+            validationResult.basicFields,
+          );
+          if (validationBasicFields) {
+            basicFields = validationBasicFields;
+          }
+
+          reportProgress({
+            operationKey: `validate-${file.name}`,
+            phase: "ai",
+            status: "done",
+            title: `AI validation completed for ${file.name}`,
+            detail: validationResult.summary,
+            fileName: file.name,
+            detectedDocuments,
+            model: validationResult.model,
+            responseSummary: validationResult.feedback.join(" | ").slice(0, 220),
+          });
+        }
       } catch {
         reportProgress({
           operationKey: `validate-${file.name}`,
@@ -1360,6 +1616,7 @@ export async function analyzeAttachments(
         notes,
         preview: await buildAttachmentPreview(file, sourceType, extractedText),
         aiValidation,
+        basicFields,
       } satisfies UploadedAttachment;
       return attachment;
     },

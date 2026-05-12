@@ -310,6 +310,8 @@ function createMockClient() {
             const expectedDocument = String(
               userPayload?.file?.expectedDocument || "",
             );
+            const hasBasicFieldsPurpose =
+              String(userPayload?.purpose || "") === "basic-fields";
 
             if (
               expectedDocument.includes("المخططات المعمارية") &&
@@ -341,15 +343,49 @@ function createMockClient() {
               choices: [
                 {
                   message: {
-                    content: JSON.stringify({
-                      status: "passed",
-                      summary: "الملف يطابق المتطلب المطلوب بشكل واضح.",
-                      feedback: [
-                        "ظهر عنوان المستند المطلوب داخل الملف.",
-                        "لا توجد ملاحظات حرجة على هذا الملف في هذه المرحلة.",
-                      ],
-                      confidence: 91,
-                    }),
+                    content: JSON.stringify(
+                      hasBasicFieldsPurpose
+                        ? {
+                            confidence: 96,
+                            basicFields: {
+                              applicantName: "محمد عبدالله علي الدوسري",
+                              nationalId: "1234567890",
+                              officeName: "",
+                              officeLicense: "",
+                              district: "السلي",
+                              plotNumber: "123",
+                            },
+                          }
+                        : {
+                            status: "passed",
+                            summary: "الملف يطابق المتطلب المطلوب بشكل واضح.",
+                            feedback: [
+                              "ظهر عنوان المستند المطلوب داخل الملف.",
+                              "لا توجد ملاحظات حرجة على هذا الملف في هذه المرحلة.",
+                            ],
+                            ...(String(
+                              userPayload?.file?.extractedText || "",
+                            ).includes("اسم المستفيد") ||
+                            String(userPayload?.file?.extractedText || "").includes(
+                              "الحي",
+                            ) ||
+                            String(userPayload?.file?.extractedText || "").includes(
+                              "رقم القطعة",
+                            )
+                              ? {
+                                  basicFields: {
+                                    applicantName: "محمد عبدالله علي الدوسري",
+                                    nationalId: "1234567890",
+                                    officeName: "",
+                                    officeLicense: "",
+                                    district: "السلي",
+                                    plotNumber: "123",
+                                  },
+                                }
+                              : {}),
+                            confidence: 91,
+                          },
+                    ),
                   },
                 },
               ],
@@ -395,6 +431,19 @@ function createMockClient() {
               parkingLikeEvidence,
               setbackLikeEvidence,
             } = createExtractionPayloadFromMessages(messages);
+            const sourceText = String(
+              [
+                messages?.[1]?.content,
+                JSON.stringify(messages?.[1]?.content || {}),
+              ]
+                .filter(Boolean)
+                .join("\n"),
+            ).toLowerCase();
+            const hasDeedLikeEvidence =
+              sourceText.includes("صك") ||
+              sourceText.includes("الاسم") ||
+              sourceText.includes("الحي") ||
+              sourceText.includes("رقم القطعة");
 
             return {
               choices: [
@@ -427,6 +476,18 @@ function createMockClient() {
                               "تمت إضافة هذه الصفحة كدليل قوي على بند الارتدادات النظامية.",
                             ]
                         : ["تم الاعتماد على قراءة مرئية للصفحات المرفوعة."],
+                      ...(hasDeedLikeEvidence
+                        ? {
+                            basicFields: {
+                              applicantName: "محمد عبدالله علي الدوسري",
+                              nationalId: "1234567890",
+                              officeName: "",
+                              officeLicense: "",
+                              district: "السلي",
+                              plotNumber: "123",
+                            },
+                          }
+                        : {}),
                     }),
                   },
                 },
@@ -1717,6 +1778,34 @@ describe("review server", () => {
       ],
       confidence: 91,
     });
+  });
+
+  test("attachment validation endpoint returns model-driven basic fields", async () => {
+    const app = await createTestApp();
+    const response = await request(app)
+      .post("/api/validate-attachment")
+      .send({
+        fileName: "deed.png",
+        mimeType: "image/png",
+        sourceType: "image",
+        requiredDocuments: ["صورة الصك"],
+        expectedDocument: "صورة الصك",
+        extractedText:
+          "الاسم الجنسية نسبة التملك 1234567890 محمد عبدالله علي الدوسري سعودي 0 الحي السلي رقم القطعة 123",
+        detectedDocuments: ["صورة الصك"],
+        notes: ["تم التعرف على البيانات الأساسية في وثيقة الصك."],
+      });
+
+    expect(response.status).toBe(200);
+    expect(response.body.basicFields).toEqual({
+      applicantName: "محمد عبدالله علي الدوسري",
+      nationalId: "1234567890",
+      officeName: "",
+      officeLicense: "",
+      district: "السلي",
+      plotNumber: "123",
+    });
+    expect(response.body.status).toBe("passed");
   });
 
   test("architectural attachment validation returns every workbook checklist point", async () => {

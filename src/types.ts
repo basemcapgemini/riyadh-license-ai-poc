@@ -47,6 +47,15 @@ export type SubmissionForm = {
   uploadedAttachments: UploadedAttachment[];
 };
 
+export type BasicFormFields = {
+  applicantName: string;
+  nationalId: string;
+  officeName: string;
+  officeLicense: string;
+  district: string;
+  plotNumber: string;
+};
+
 export type AttachmentSourceType =
   | "pdf"
   | "docx"
@@ -80,6 +89,7 @@ export type UploadedAttachment = {
   notes: string[];
   preview?: AttachmentPreview;
   aiValidation?: AttachmentAiValidation;
+  basicFields?: BasicFormFields;
 };
 
 export type AttachmentPreview = {

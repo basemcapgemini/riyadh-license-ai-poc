@@ -1,8 +1,9 @@
 import { fetchJson } from "./http";
-import type { AttachmentAiValidation } from "../types";
+import type { AttachmentAiValidation, BasicFormFields } from "../types";
 
 export type AttachmentValidationResult = AttachmentAiValidation & {
   model: string;
+  basicFields?: BasicFormFields;
 };
 
 export async function requestAttachmentValidation(input: {

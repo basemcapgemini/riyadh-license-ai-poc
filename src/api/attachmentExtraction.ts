@@ -1,4 +1,5 @@
 import { fetchJson } from "./http";
+import type { BasicFormFields } from "../types";
 
 export type AttachmentExtractionResult = {
   model: string;
@@ -6,6 +7,7 @@ export type AttachmentExtractionResult = {
   extractedText: string;
   detectedDocuments: string[];
   notes: string[];
+  basicFields?: BasicFormFields;
 };
 
 export async function requestAttachmentExtraction(input: {
@@ -14,6 +16,7 @@ export async function requestAttachmentExtraction(input: {
   requiredDocuments: string[];
   localExtractedText: string;
   extractionMode?: "standard" | "cad-critical";
+  purpose?: "standard" | "basic-fields";
   pageImages: Array<{
     pageNumber: number;
     dataUrl: string;
