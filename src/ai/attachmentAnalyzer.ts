@@ -26,7 +26,7 @@ GlobalWorkerOptions.workerSrc = new URL(
 
 const MAX_ATTACHMENT_TEXT_LENGTH = 24000;
 const MAX_AI_ATTACHMENT_TEXT_LENGTH = 6000;
-const AI_PDF_BATCH_SIZE = 6;
+const AI_PDF_BATCH_SIZE = 4;
 const MAX_PARALLEL_ATTACHMENT_ANALYSIS = 1;
 const MAX_PDF_OCR_FALLBACK_PAGES = 8;
 const CAD_SAMPLE_LOCAL_TEXT_PAGES = 10;
@@ -548,9 +548,9 @@ async function buildPdfPageImagesForAi(
       return {
         pageNumber,
         dataUrl: await renderPdfPageToDataUrl(page, {
-          scale: 1.5,
+          scale: 1.1,
           mimeType: "image/jpeg",
-          quality: 0.82,
+          quality: 0.68,
         }),
       };
     },
@@ -569,9 +569,9 @@ async function buildPdfPageImagesForCadClassification(
       return {
         pageNumber,
         dataUrl: await renderPdfPageToDataUrl(page, {
-          scale: 1,
+          scale: 0.85,
           mimeType: "image/jpeg",
-          quality: 0.68,
+          quality: 0.58,
         }),
       };
     },
@@ -1181,9 +1181,12 @@ async function renderImageVariantToDataUrl(
   options: {
     scale?: number;
     mode?: "original" | "grayscale" | "threshold";
+    mimeType?: "image/png" | "image/jpeg";
+    quality?: number;
   } = {},
 ): Promise<string> {
-  const { scale = 2, mode = "original" } = options;
+  const { scale = 2, mode = "original", mimeType = "image/png", quality } =
+    options;
   const image = await loadImageElement(file);
   const canvas = document.createElement("canvas");
   const context = canvas.getContext("2d", { willReadFrequently: true });
@@ -1203,7 +1206,9 @@ async function renderImageVariantToDataUrl(
     applyImageEnhancement(context, canvas.width, canvas.height, "threshold");
   }
 
-  return canvas.toDataURL("image/png");
+  return mimeType === "image/jpeg"
+    ? canvas.toDataURL(mimeType, quality ?? 0.75)
+    : canvas.toDataURL(mimeType);
 }
 
 function scoreOcrTextCandidate(text: string): number {
@@ -1259,8 +1264,10 @@ async function extractBasicFieldsFromImage(file: File, extractedText: string) {
       {
         pageNumber: 1,
         dataUrl: await renderImageVariantToDataUrl(file, {
-          scale: 2,
+          scale: 1.15,
           mode: "original",
+          mimeType: "image/jpeg",
+          quality: 0.72,
         }),
       },
     ];
