@@ -312,6 +312,9 @@ function createMockClient() {
             );
             const hasBasicFieldsPurpose =
               String(userPayload?.purpose || "") === "basic-fields";
+            const hasIncompleteMarker = String(
+              userPayload?.file?.extractedText || "",
+            ).includes("FORCE_INCOMPLETE_RESPONSE");
 
             if (
               expectedDocument.includes("المخططات المعمارية") &&
@@ -344,47 +347,52 @@ function createMockClient() {
                 {
                   message: {
                     content: JSON.stringify(
-                      hasBasicFieldsPurpose
+                      hasIncompleteMarker
                         ? {
-                            confidence: 96,
-                            basicFields: {
-                              applicantName: "محمد عبدالله علي الدوسري",
-                              nationalId: "1234567890",
-                              officeName: "",
-                              officeLicense: "",
-                              district: "السلي",
-                              plotNumber: "123",
-                            },
-                          }
-                        : {
                             status: "passed",
-                            summary: "الملف يطابق المتطلب المطلوب بشكل واضح.",
-                            feedback: [
-                              "ظهر عنوان المستند المطلوب داخل الملف.",
-                              "لا توجد ملاحظات حرجة على هذا الملف في هذه المرحلة.",
-                            ],
-                            ...(String(
-                              userPayload?.file?.extractedText || "",
-                            ).includes("اسم المستفيد") ||
-                            String(userPayload?.file?.extractedText || "").includes(
-                              "الحي",
-                            ) ||
-                            String(userPayload?.file?.extractedText || "").includes(
-                              "رقم القطعة",
-                            )
-                              ? {
-                                  basicFields: {
-                                    applicantName: "محمد عبدالله علي الدوسري",
-                                    nationalId: "1234567890",
-                                    officeName: "",
-                                    officeLicense: "",
-                                    district: "السلي",
-                                    plotNumber: "123",
-                                  },
-                                }
-                              : {}),
-                            confidence: 91,
-                          },
+                            confidence: 74,
+                          }
+                        : hasBasicFieldsPurpose
+                          ? {
+                              confidence: 96,
+                              basicFields: {
+                                applicantName: "محمد عبدالله علي الدوسري",
+                                nationalId: "1234567890",
+                                officeName: "",
+                                officeLicense: "",
+                                district: "السلي",
+                                plotNumber: "123",
+                              },
+                            }
+                          : {
+                              status: "passed",
+                              summary: "الملف يطابق المتطلب المطلوب بشكل واضح.",
+                              feedback: [
+                                "ظهر عنوان المستند المطلوب داخل الملف.",
+                                "لا توجد ملاحظات حرجة على هذا الملف في هذه المرحلة.",
+                              ],
+                              ...(String(
+                                userPayload?.file?.extractedText || "",
+                              ).includes("اسم المستفيد") ||
+                              String(userPayload?.file?.extractedText || "").includes(
+                                "الحي",
+                              ) ||
+                              String(userPayload?.file?.extractedText || "").includes(
+                                "رقم القطعة",
+                              )
+                                ? {
+                                    basicFields: {
+                                      applicantName: "محمد عبدالله علي الدوسري",
+                                      nationalId: "1234567890",
+                                      officeName: "",
+                                      officeLicense: "",
+                                      district: "السلي",
+                                      plotNumber: "123",
+                                    },
+                                  }
+                                : {}),
+                              confidence: 91,
+                            },
                     ),
                   },
                 },
@@ -1806,6 +1814,29 @@ describe("review server", () => {
       plotNumber: "123",
     });
     expect(response.body.status).toBe("passed");
+  });
+
+  test("attachment validation endpoint synthesizes feedback when model response is incomplete", async () => {
+    const app = await createTestApp();
+    const response = await request(app)
+      .post("/api/validate-attachment")
+      .send({
+        fileName: "incomplete-response.png",
+        mimeType: "image/png",
+        sourceType: "image",
+        requiredDocuments: ["صورة الصك"],
+        expectedDocument: "صورة الصك",
+        extractedText: "FORCE_INCOMPLETE_RESPONSE",
+        detectedDocuments: ["صورة الصك"],
+        notes: ["تم العثور على مستند الصك من خلال التحديد الأولي."],
+      });
+
+    expect(response.status).toBe(200);
+    expect(response.body.summary).toBe("الملف يطابق صورة الصك بشكل واضح.");
+    expect(response.body.feedback.length).toBeGreaterThan(0);
+    expect(response.body.feedback.join(" ")).toContain(
+      "تمت مطابقة الملف مع المتطلب المتوقع صورة الصك.",
+    );
   });
 
   test("architectural attachment validation returns every workbook checklist point", async () => {

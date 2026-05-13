@@ -833,6 +833,86 @@ function normalizeAttachmentValidationStatus(value) {
     : "warning";
 }
 
+function buildAttachmentValidationFallbackSummary({
+  expectedDocument,
+  detectedDocuments,
+  notes,
+  basicFields,
+}) {
+  const matchedDocuments = Array.isArray(detectedDocuments)
+    ? detectedDocuments
+    : [];
+  const noteCount = Array.isArray(notes) ? notes.filter(Boolean).length : 0;
+  const hasBasicFields = basicFields
+    ? Object.values(basicFields).some(Boolean)
+    : false;
+
+  if (
+    expectedDocument &&
+    matchedDocuments.some(
+      (documentName) =>
+        normalizeArabic(documentName) === normalizeArabic(expectedDocument),
+    )
+  ) {
+    return `الملف يطابق ${expectedDocument} بشكل واضح.`;
+  }
+
+  if (matchedDocuments.length > 0) {
+    return `تمت مطابقة الملف مبدئياً مع: ${matchedDocuments.slice(0, 2).join("، ")}.`;
+  }
+
+  if (hasBasicFields) {
+    return "تمت قراءة الملف واستخراج بعض البيانات الأساسية منه، لكن الملخص التفصيلي من النموذج كان ناقصاً.";
+  }
+
+  if (noteCount > 0) {
+    return "تمت مراجعة الملف، لكن ملخص النموذج كان ناقصاً وتوجد ملاحظات تشغيلية فقط.";
+  }
+
+  return "تمت مراجعة الملف، لكن النموذج لم يقدّم ملخصاً تفصيلياً كافياً.";
+}
+
+function buildAttachmentValidationFallbackFeedback({
+  expectedDocument,
+  detectedDocuments,
+  notes,
+  basicFields,
+  fileName,
+}) {
+  const feedback = [];
+  const matchedDocuments = Array.isArray(detectedDocuments)
+    ? detectedDocuments
+    : [];
+  const noteList = normalizeStringList(notes, 3);
+  const hasBasicFields = basicFields
+    ? Object.values(basicFields).some(Boolean)
+    : false;
+
+  if (expectedDocument && matchedDocuments.length > 0) {
+    feedback.push(
+      `تمت مطابقة الملف مع المتطلب المتوقع ${expectedDocument}.`,
+    );
+  } else if (matchedDocuments.length > 0) {
+    feedback.push(`تم ربط الملف مبدئياً مع: ${matchedDocuments.slice(0, 2).join("، ")}.`);
+  } else {
+    feedback.push(
+      fileName
+        ? `تمت مراجعة الملف ${fileName} لكن الاستجابة النصية من النموذج كانت غير مكتملة.`
+        : "تمت مراجعة الملف لكن الاستجابة النصية من النموذج كانت غير مكتملة.",
+    );
+  }
+
+  if (hasBasicFields) {
+    feedback.push("تم استخراج بعض الحقول الأساسية من الملف المرفوع.");
+  }
+
+  if (noteList.length > 0) {
+    feedback.push(`ملاحظات الملف: ${noteList.join("، ")}.`);
+  }
+
+  return Array.from(new Set(feedback.filter(Boolean))).slice(0, 6);
+}
+
 function normalizeAttachmentChecklistStatus(value) {
   return value === "Compliant" ||
     value === "Non-Compliant" ||
@@ -3547,19 +3627,32 @@ export function createReviewApp(options = {}) {
           ? modelFeedback
           : buildArchitecturalValidationFeedback(checklistResults)
         : modelFeedback;
-
-      if (!responseSummary || responseFeedback.length === 0) {
-        return res.status(502).json({
-          error:
-            "AI validation response was incomplete. The model did not return usable feedback for this file.",
-        });
-      }
+      const fallbackSummary = isArchitecturalPlansValidation
+        ? buildArchitecturalValidationSummary(checklistResults)
+        : buildAttachmentValidationFallbackSummary({
+            expectedDocument: normalizedExpectedDocument,
+            detectedDocuments: normalizedDetectedDocuments,
+            notes: normalizedNotes,
+            basicFields: hasBasicFields ? basicFields : undefined,
+          });
+      const fallbackFeedback = isArchitecturalPlansValidation
+        ? buildArchitecturalValidationFeedback(checklistResults)
+        : buildAttachmentValidationFallbackFeedback({
+            expectedDocument: normalizedExpectedDocument,
+            detectedDocuments: normalizedDetectedDocuments,
+            notes: normalizedNotes,
+            basicFields: hasBasicFields ? basicFields : undefined,
+            fileName,
+          });
+      const finalSummary = responseSummary || fallbackSummary;
+      const finalFeedback =
+        responseFeedback.length > 0 ? responseFeedback : fallbackFeedback;
 
       return res.json({
         model,
         status: normalizeAttachmentValidationStatus(parsed.status),
-        summary: responseSummary,
-        feedback: responseFeedback,
+        summary: finalSummary,
+        feedback: finalFeedback,
         confidence: normalizeConfidence(parsed.confidence),
         ...(hasBasicFields ? { basicFields } : {}),
         ...(checklistResults.length > 0 ? { checklistResults } : {}),
