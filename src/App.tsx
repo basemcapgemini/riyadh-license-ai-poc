@@ -141,8 +141,6 @@ function getSubmissionValidationErrors(
   if (policy && (policy.projectTypes?.length ?? 0) > 0 && !form.projectSubtypeId) {
     errors.push("التصنيف التفصيلي للمشروع مطلوب.");
   }
-  if (form.projectDescription.trim().length < 20)
-    errors.push("وصف المشروع يجب أن يكون أوضح وأطول من 20 حرفاً.");
   if (form.uploadedAttachments.length === 0)
     errors.push("يجب رفع ملف فعلي واحد على الأقل قبل الإرسال.");
 
@@ -2129,7 +2127,6 @@ export default function App() {
 
     const hasMinimumDraftContext =
       form.uploadedAttachments.length > 0 &&
-      form.projectDescription.trim().length >= 20 &&
       form.district.trim().length > 0 &&
       form.plotNumber.trim().length > 0;
 
@@ -2611,6 +2608,7 @@ export default function App() {
                     }
                     placeholder="اكتب وصف المشروع هنا"
                   />
+                  <small>اختياري، لكن وصفاً مختصراً يساعد في تحسين المراجعة.</small>
                 </label>
 
                 <label className="field">
