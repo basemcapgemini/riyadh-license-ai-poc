@@ -1288,30 +1288,28 @@ async function extractBasicFieldsFromImage(file: File, extractedText: string) {
 }
 
 async function readImageWithOcr(file: File): Promise<string> {
-  const candidates: string[] = [];
-
-  try {
-    const directResult = await recognize(file, "ara+eng");
-    candidates.push(directResult.data.text || "");
-  } catch {
-    // Ignore the direct pass and continue with preprocessed variants.
-  }
-
   const variants = [
     { scale: 2, mode: "original" as const },
     { scale: 3, mode: "grayscale" as const },
     { scale: 3, mode: "threshold" as const },
   ];
 
-  for (const variant of variants) {
-    try {
+  const candidatePromises = [
+    recognize(file, "ara+eng").then((result) => result.data.text || ""),
+    ...variants.map(async (variant) => {
       const dataUrl = await renderImageVariantToDataUrl(file, variant);
       const result = await recognize(dataUrl, "ara+eng");
-      candidates.push(result.data.text || "");
-    } catch {
-      // Continue trying the remaining variants.
-    }
-  }
+      return result.data.text || "";
+    }),
+  ];
+
+  const settledCandidates = await Promise.allSettled(candidatePromises);
+  const candidates = settledCandidates
+    .filter(
+      (result): result is PromiseFulfilledResult<string> =>
+        result.status === "fulfilled",
+    )
+    .map((result) => result.value);
 
   const bestCandidate =
     candidates.sort((left, right) => scoreOcrTextCandidate(right) - scoreOcrTextCandidate(left))[0] ?? "";
