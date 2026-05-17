@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import { useMutation } from "@tanstack/react-query";
 import { policies, emptyForm } from "./data/policyData";
+import notesForCheckJson from "./data/notesForCheck.generated.json";
 import { requestLlmReview } from "./api/llmReview";
 import { fetchJson, resolveApiUrl } from "./api/http";
 import {
@@ -17,11 +18,18 @@ import type {
   ApplicationRecord,
   AttachmentPreview,
   AttachmentAnalysisTraceEvent,
+  AttachmentChecklistResult,
+  ComplianceAttachmentAccuracyStatus,
+  ComplianceAttachmentStatus,
+  ComplianceDataConsistencyStatus,
+  ComplianceRequirementsStatus,
   DocumentValidation,
   EvidenceCitation,
   BasicFormFields,
+  FirstLayerComplianceSnapshot,
   LicensePolicy,
   LlmReview,
+  ReviewResult,
   SubmissionForm,
   SuggestedResponse,
   SuggestedResponseActionType,
@@ -81,6 +89,19 @@ type BulkUploadPreviewItem = {
   suggestedDocumentName: string;
   topCandidateDocumentName?: string;
   suggestions: BulkUploadMatchOption[];
+};
+
+type MunicipalityActionType =
+  | "request-completion"
+  | "return-to-reviewer"
+  | "approve-final";
+
+type MunicipalityActionModalState = {
+  applicationId: string;
+  actionType: MunicipalityActionType;
+  title: string;
+  description: string;
+  confirmLabel: string;
 };
 
 const LEGACY_STORAGE_KEYS = [
@@ -338,6 +359,500 @@ function buildBulkUploadPreviewItems(
 
 function uniqueStrings(values: string[]) {
   return Array.from(new Set(values.filter(Boolean)));
+}
+
+type DataConsistencyFieldConfig = {
+  field: string;
+  aliases: readonly string[];
+  submissionFallbackKey?: keyof SubmissionForm;
+  allowPrefixValue?: boolean;
+  basicFieldKey?: keyof BasicFormFields;
+};
+
+const DATA_CONSISTENCY_FIELDS: DataConsistencyFieldConfig[] = [
+  {
+    field: "Plot Number",
+    aliases: [
+      "plot number",
+      "plot no",
+      "رقم القطعة",
+      "رقم قطعه",
+      "رقم الارض",
+      "رقم الأرض",
+      "رقم القسيمة",
+    ],
+    submissionFallbackKey: "plotNumber",
+    allowPrefixValue: true,
+    basicFieldKey: "plotNumber",
+  },
+  {
+    field: "Beneficiary Name",
+    aliases: [
+      "beneficiary name",
+      "owner name",
+      "applicant name",
+      "اسم المستفيد",
+      "اسم المالك",
+      "المالك",
+    ],
+    submissionFallbackKey: "applicantName",
+    basicFieldKey: "applicantName",
+  },
+  {
+    field: "Engineering Office",
+    aliases: [
+      "engineering office",
+      "consultant office",
+      "office name",
+      "المكتب الهندسي",
+      "اسم المكتب",
+      "الاستشاري",
+    ],
+    submissionFallbackKey: "officeName",
+    basicFieldKey: "officeName",
+  },
+  {
+    field: "Plan Number",
+    aliases: [
+      "plan number",
+      "plan no",
+      "رقم المخطط",
+      "المخطط رقم",
+      "رقم المخطط التنظيمي",
+    ],
+  },
+  {
+    field: "Deed Number",
+    aliases: [
+      "deed number",
+      "deed no",
+      "sak number",
+      "رقم الصك",
+      "الصك رقم",
+      "رقم سند الملكية",
+      "رقم الوثيقة",
+      "الوثيقة رقم",
+    ],
+    allowPrefixValue: true,
+    basicFieldKey: "deedNumber",
+  },
+];
+
+function normalizeIndicDigits(value: string) {
+  return String(value || "").replace(/[٠-٩]/g, (digit) =>
+    String(digit.charCodeAt(0) - 1632),
+  );
+}
+
+function normalizeComparableValue(value: string) {
+  return normalizeArabic(normalizeIndicDigits(value || ""));
+}
+
+function escapeRegex(value: string) {
+  return String(value || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function cleanExtractedFieldValue(value: string) {
+  return String(value || "")
+    .replace(/^[\s:;،,.\-|]+/u, "")
+    .replace(/[\s|]+$/u, "")
+    .trim()
+    .slice(0, 120);
+}
+
+function buildFieldValueRegex(aliases: readonly string[]) {
+  const aliasPattern = aliases.map((alias) => escapeRegex(alias)).join("|");
+  return new RegExp(
+    `(?:${aliasPattern})\\s*(?:رقم\\s*)?(?::|：|#|-)?\\s*([^\\n\\r|]{1,100})`,
+    "iu",
+  );
+}
+
+function buildFieldValuePrefixRegex(aliases: readonly string[]) {
+  const aliasPattern = aliases.map((alias) => escapeRegex(alias)).join("|");
+  return new RegExp(
+    `([^\\n\\r|]{1,100})\\s*(?:رقم\\s*)?(?::|：|#|-)?\\s*(?:${aliasPattern})`,
+    "iu",
+  );
+}
+
+function extractFieldValueFromText(
+  text: string,
+  aliases: readonly string[],
+  options: { allowPrefixValue?: boolean } = {},
+) {
+  const normalizedText = normalizeIndicDigits(text || "");
+  const directMatch = normalizedText.match(buildFieldValueRegex(aliases));
+  if (directMatch?.[1]) {
+    return cleanExtractedFieldValue(directMatch[1]);
+  }
+
+  if (options.allowPrefixValue) {
+    const prefixMatch = normalizedText.match(buildFieldValuePrefixRegex(aliases));
+    if (prefixMatch?.[1]) {
+      const candidate = cleanExtractedFieldValue(prefixMatch[1]);
+      if (candidate) {
+        return candidate;
+      }
+    }
+  }
+
+  const lines = normalizedText.split(/\r?\n/);
+  for (const line of lines) {
+    const normalizedLine = normalizeArabic(line);
+    const matchedAlias = aliases.find((alias) =>
+      normalizedLine.includes(normalizeArabic(alias)),
+    );
+    if (!matchedAlias) {
+      continue;
+    }
+
+    const fallbackMatch = line.match(buildFieldValueRegex([matchedAlias]));
+    if (fallbackMatch?.[1]) {
+      return cleanExtractedFieldValue(fallbackMatch[1]);
+    }
+
+    if (options.allowPrefixValue) {
+      const prefixFallbackMatch = line.match(
+        buildFieldValuePrefixRegex([matchedAlias]),
+      );
+      if (prefixFallbackMatch?.[1]) {
+        const candidate = cleanExtractedFieldValue(prefixFallbackMatch[1]);
+        if (candidate) {
+          return candidate;
+        }
+      }
+    }
+
+    return cleanExtractedFieldValue(line);
+  }
+
+  return "";
+}
+
+function getConsistencyCheckItems() {
+  return (notesForCheckJson.checklistItems ?? [])
+    .filter((item) => item.kind === "consistency")
+    .map((item) => item.text)
+    .filter(Boolean);
+}
+
+function buildExpectedDataConsistencyFields() {
+  const workbookFields: DataConsistencyFieldConfig[] = getConsistencyCheckItems().map((field) => ({
+    field,
+    aliases: [] as readonly string[],
+  }));
+
+  return [
+    ...DATA_CONSISTENCY_FIELDS,
+    ...workbookFields.filter(
+      (fieldConfig) =>
+        !DATA_CONSISTENCY_FIELDS.some(
+          (baseField) =>
+            normalizeArabic(baseField.field) ===
+            normalizeArabic(fieldConfig.field),
+        ),
+    ),
+  ];
+}
+
+function findValueInAttachments(
+  attachments: UploadedAttachment[],
+  fieldConfig: DataConsistencyFieldConfig,
+) {
+  for (const attachment of attachments) {
+    const value = extractFieldValueFromText(
+      attachment.extractedText,
+      fieldConfig.aliases,
+      { allowPrefixValue: Boolean(fieldConfig.allowPrefixValue) },
+    );
+    if (value) {
+      return {
+        value,
+        sourceRef: attachment.name,
+      };
+    }
+  }
+
+  return null;
+}
+
+function findBasicFieldValueInAttachments(
+  attachments: UploadedAttachment[],
+  fieldKey?: keyof BasicFormFields,
+) {
+  if (!fieldKey) {
+    return null;
+  }
+
+  for (const attachment of attachments) {
+    const value = attachment.basicFields?.[fieldKey];
+    if (value) {
+      return {
+        value: cleanExtractedFieldValue(value),
+        sourceRef: attachment.name,
+      };
+    }
+  }
+
+  return null;
+}
+
+function buildFirstLayerDataConsistencyRows(submission: SubmissionForm) {
+  const attachments = submission.uploadedAttachments;
+  const sakAttachments = attachments.filter((attachment) => {
+    const detectedDocuments = Array.isArray(attachment.detectedDocuments)
+      ? attachment.detectedDocuments
+      : [];
+    return (
+      attachment.requiredDocument === "صورة الصك" ||
+      detectedDocuments.includes("صورة الصك") ||
+      normalizeArabic(attachment.name).includes(normalizeArabic("صك"))
+    );
+  });
+  const nonSakAttachments = attachments.filter(
+    (attachment) => !sakAttachments.includes(attachment),
+  );
+
+  return buildExpectedDataConsistencyFields().map((fieldConfig) => {
+    if (fieldConfig.aliases.length === 0) {
+      return {
+        field: fieldConfig.field,
+        sak: "Missing",
+        otherDocs: "Missing",
+        status: "Missing" as ComplianceDataConsistencyStatus,
+        sourceRefs: [notesForCheckJson.sourcePath],
+      };
+    }
+
+    const sakMatch = findValueInAttachments(sakAttachments, fieldConfig);
+    const otherMatch = findValueInAttachments(nonSakAttachments, fieldConfig);
+    const sakBasicMatch = findBasicFieldValueInAttachments(
+      sakAttachments,
+      fieldConfig.basicFieldKey,
+    );
+    const otherBasicMatch = findBasicFieldValueInAttachments(
+      nonSakAttachments,
+      fieldConfig.basicFieldKey,
+    );
+    const submissionValue = fieldConfig.submissionFallbackKey
+      ? cleanExtractedFieldValue(
+          String(submission[fieldConfig.submissionFallbackKey] || ""),
+        )
+      : "";
+    const otherValue =
+      otherBasicMatch?.value || otherMatch?.value || submissionValue || "Missing";
+    const sakValue =
+      sakBasicMatch?.value || sakMatch?.value || submissionValue || "Missing";
+    const status =
+      sakValue === "Missing" || otherValue === "Missing"
+        ? ("Missing" as ComplianceDataConsistencyStatus)
+        : normalizeComparableValue(sakValue) ===
+            normalizeComparableValue(otherValue)
+          ? ("Match" as ComplianceDataConsistencyStatus)
+          : ("Mismatch" as ComplianceDataConsistencyStatus);
+
+    return {
+      field: fieldConfig.field,
+      sak: sakValue,
+      otherDocs: otherValue,
+      status,
+      sourceRefs: [sakMatch?.sourceRef, otherMatch?.sourceRef].filter(
+        (value): value is string => Boolean(value),
+      ),
+    };
+  });
+}
+
+function buildFirstLayerAttachmentAccuracy(
+  attachments: UploadedAttachment[],
+  requiredDocuments: string[],
+  missingDocuments: string[],
+) {
+  const accuracyNotes: string[] = [];
+  const mislinkedAttachments = attachments.filter((attachment) => {
+    if (!attachment.requiredDocument) {
+      return false;
+    }
+
+    return !attachment.detectedDocuments.includes(attachment.requiredDocument);
+  });
+  const unrelatedAttachments = attachments.filter(
+    (attachment) =>
+      !attachment.requiredDocument && attachment.detectedDocuments.length === 0,
+  );
+  const offPolicyAttachments = attachments.filter((attachment) =>
+    attachment.detectedDocuments.some(
+      (documentName) => !requiredDocuments.includes(documentName),
+    ),
+  );
+
+  mislinkedAttachments.forEach((attachment) => {
+    accuracyNotes.push(
+      `الملف ${attachment.name} مرفوع تحت ${attachment.requiredDocument} لكن التحليل لم يؤكد مطابقته لهذا المتطلب.`,
+    );
+  });
+  unrelatedAttachments.forEach((attachment) => {
+    accuracyNotes.push(
+      `الملف ${attachment.name} لم يرتبط بمتطلب واضح وقد يكون غير ذي صلة أو غير مقروء بشكل كاف.`,
+    );
+  });
+  offPolicyAttachments.forEach((attachment) => {
+    accuracyNotes.push(
+      `الملف ${attachment.name} يحتوي على مؤشرات لمستندات خارج قائمة المتطلبات الحالية.`,
+    );
+  });
+
+  if (missingDocuments.length > 0) {
+    accuracyNotes.push(
+      `لا يمكن اعتبار الربط كاملاً لأن بعض المرفقات المطلوبة ما زالت ناقصة: ${missingDocuments.join("، ")}.`,
+    );
+  }
+
+  const hasAnyValidAttachment = attachments.some((attachment) =>
+    attachment.detectedDocuments.some((documentName) =>
+      requiredDocuments.includes(documentName),
+    ),
+  );
+
+  return {
+    status: (
+      accuracyNotes.length === 0
+        ? "Valid"
+        : hasAnyValidAttachment
+          ? "Partially Valid"
+          : "Invalid"
+    ) as ComplianceAttachmentAccuracyStatus,
+    notes:
+      accuracyNotes.length > 0
+        ? accuracyNotes.slice(0, 12)
+        : [
+            "المرفقات الحالية مرتبطة منطقياً بالصك ونوع المشروع والمتطلبات المطلوبة.",
+          ],
+  };
+}
+
+function buildFirstLayerArchitecturalCompliance(
+  attachments: UploadedAttachment[],
+) {
+  const architecturalAttachment = attachments.find(isArchitecturalAttachment);
+  const checklistResults =
+    architecturalAttachment?.aiValidation?.checklistResults ?? [];
+  const notesForCheck = checklistResults.map((row) => ({
+    item: row.item,
+    status: row.status,
+    comment: row.comment,
+    sourceRefs: architecturalAttachment?.name ? [architecturalAttachment.name] : [],
+  }));
+  const requirementsCompliance =
+    notesForCheck.length > 0 && notesForCheck.every((row) => row.status === "Compliant")
+      ? ("Compliant" as ComplianceRequirementsStatus)
+      : ("Not Compliant" as ComplianceRequirementsStatus);
+  const violations = notesForCheck
+    .filter((row) => row.status !== "Compliant")
+    .map((row) => `${row.item}: ${row.comment}`)
+    .slice(0, 24);
+
+  return {
+    requirementsCompliance,
+    notesForCheck,
+    violations,
+  };
+}
+
+function buildFirstLayerComplianceSnapshot(
+  policy: LicensePolicy,
+  submission: SubmissionForm,
+  review: ReviewResult,
+): FirstLayerComplianceSnapshot {
+  const requiredDocuments = policy.requiredDocuments ?? [];
+  const attachmentsStatusRows = [
+    {
+      attachment: "المرفقات الأساسية",
+      status: (review.missingDocuments.length > 0
+        ? "Missing"
+        : "Present") as ComplianceAttachmentStatus,
+      notes:
+        review.missingDocuments.length > 0
+          ? `المرفقات الأساسية غير مكتملة وفق الفحص الأول: ${review.missingDocuments
+              .slice(0, 5)
+              .join("، ")}.`
+          : "المرفقات الأساسية ظاهرة ومقبولة وفق الفحص الأول.",
+      sourceRefs: [] as string[],
+    },
+  ];
+  const dataConsistencyCheck = buildFirstLayerDataConsistencyRows(submission);
+  const attachmentAccuracy = buildFirstLayerAttachmentAccuracy(
+    submission.uploadedAttachments,
+    requiredDocuments,
+    review.missingDocuments,
+  );
+  const architecturalCompliance = buildFirstLayerArchitecturalCompliance(
+    submission.uploadedAttachments,
+  );
+  const dataConsistencySummary = dataConsistencyCheck.every(
+    (row) => row.status === "Match",
+  )
+    ? "البيانات متطابقة وفق الفحص الأول."
+    : dataConsistencyCheck.some((row) => row.status === "Mismatch")
+      ? "البيانات غير متطابقة وفق الفحص الأول."
+      : "البيانات تحتاج استكمالاً وفق الفحص الأول.";
+  const architecturalSummary =
+    architecturalCompliance.notesForCheck.length > 0
+      ? "تمت إعادة استخدام نتيجة الامتثال المعماري من الفحص الأول دون إعادة تحليل."
+      : review.status === "ready"
+        ? "لا توجد نواقص معمارية جوهرية في نتيجة الفحص الأول."
+        : "الامتثال المعماري يحتاج استكمال البنود الناقصة الظاهرة في الفحص الأول.";
+
+  return {
+    projectInformation: {
+      projectType: buildProjectTypeSummary(
+        policy,
+        submission.projectTypeGroupId,
+        submission.projectSubtypeId,
+      ),
+      confidenceLevel:
+        review.score >= 75 ? "High" : review.score >= 45 ? "Medium" : "Low",
+    },
+    attachmentsStatus: {
+      overallStatus: review.status === "ready" ? "Complete" : "Incomplete",
+      rows: attachmentsStatusRows,
+    },
+    dataConsistencyCheck,
+    attachmentAccuracy,
+    architecturalCompliance: {
+      requirementsCompliance: architecturalCompliance.requirementsCompliance,
+      notesForCheck:
+        architecturalCompliance.notesForCheck.length > 0
+          ? architecturalCompliance.notesForCheck
+          : [
+              {
+                item: "الامتثال المعماري",
+                status:
+                  review.status === "ready" ? "Compliant" : "Non-Compliant",
+                comment: architecturalSummary,
+                sourceRefs: [],
+              },
+            ],
+      violations: architecturalCompliance.violations,
+    },
+    finalSummary: {
+      attachments: attachmentsStatusRows[0].notes,
+      dataConsistency: dataConsistencySummary,
+      architecturalCompliance: architecturalSummary,
+      keyIssues:
+        review.missingDocuments.length > 0
+          ? review.missingDocuments
+              .slice(0, 6)
+              .map(
+                (documentName) =>
+                  `${documentName}: هذا المرفق مفقود ويجب استكماله.`,
+              )
+          : architecturalCompliance.violations.length > 0
+            ? architecturalCompliance.violations
+            : ["الملف متماسك مبدئياً وفق الفحص الأول."],
+    },
+  };
 }
 
 function getValidatedDocumentNames(validations: DocumentValidation[]) {
@@ -669,6 +1184,27 @@ function AttachmentPreviewAction({
       معاينة الملف
     </button>
   );
+}
+
+function isArchitecturalAttachment(attachment: UploadedAttachment) {
+  const requiredDocument = normalizeArabic(attachment.requiredDocument || "");
+
+  return (
+    requiredDocument.includes(normalizeArabic("المخططات المعمارية")) ||
+    attachment.detectedDocuments.some((documentName) =>
+      normalizeArabic(documentName).includes(
+        normalizeArabic("المخططات المعمارية"),
+      ),
+    )
+  );
+}
+
+function getFirstLayerArchitecturalChecklistResults(
+  attachments: UploadedAttachment[],
+): AttachmentChecklistResult[] {
+  const architecturalAttachment = attachments.find(isArchitecturalAttachment);
+
+  return architecturalAttachment?.aiValidation?.checklistResults ?? [];
 }
 
 function HelpHint({ text }: { text: string }) {
@@ -1227,11 +1763,50 @@ function AnalysisTracePanel({
   );
 }
 
-function ComplianceReportSection({ review }: { review: LlmReview }) {
+function ComplianceReportSection({
+  review,
+  attachments,
+}: {
+  review: LlmReview;
+  attachments: UploadedAttachment[];
+}) {
   const report = review.complianceReport;
   if (!report) {
     return null;
   }
+
+  const firstLayerArchitecturalResults =
+    getFirstLayerArchitecturalChecklistResults(attachments);
+  const architecturalRows =
+    firstLayerArchitecturalResults.length > 0
+      ? firstLayerArchitecturalResults.map((row) => ({
+          item: row.item,
+          status: row.status,
+          comment: row.comment,
+        }))
+      : report.architecturalCompliance.notesForCheck;
+  const requirementsCompliance =
+    firstLayerArchitecturalResults.length > 0
+      ? firstLayerArchitecturalResults.every(
+            (row) => row.status === "Compliant",
+          )
+        ? "Compliant"
+        : "Not Compliant"
+      : report.architecturalCompliance.requirementsCompliance;
+  const architecturalViolations =
+    firstLayerArchitecturalResults.length > 0
+      ? firstLayerArchitecturalResults
+          .filter((row) => row.status !== "Compliant")
+          .map((row) => `${row.item}: ${row.comment}`)
+      : report.architecturalCompliance.violations;
+  const architecturalSummary =
+    firstLayerArchitecturalResults.length > 0
+      ? firstLayerArchitecturalResults.every(
+            (row) => row.status === "Compliant",
+          )
+        ? "تم عرض نفس نتيجة الامتثال المعماري من الفحص الأول."
+        : "تم عرض نفس نتيجة الامتثال المعماري من الفحص الأول مع البنود غير المتوافقة."
+      : report.finalSummary.architecturalCompliance;
 
   const missingAttachmentRows = report.attachmentsStatus.rows.filter(
     (row) => row.status === "Missing",
@@ -1244,10 +1819,43 @@ function ComplianceReportSection({ review }: { review: LlmReview }) {
     return value;
   };
 
-  const formatAttachmentStatus = (value: string) => {
-    if (value === "Present") return "موجود";
-    if (value === "Missing") return "مفقود";
-    if (value === "Invalid / Unclear") return "غير واضح / غير صالح";
+  const renderAttachmentStatusBadge = (value: string) => {
+    if (value === "Present") {
+      return (
+        <span
+          className="status-pill compliance-status-pill present"
+          aria-label="موجود"
+          title="موجود"
+        >
+          <span aria-hidden="true">✓</span>
+        </span>
+      );
+    }
+
+    if (value === "Missing") {
+      return (
+        <span
+          className="status-pill compliance-status-pill missing"
+          aria-label="مفقود"
+          title="مفقود"
+        >
+          <span aria-hidden="true">!</span>
+        </span>
+      );
+    }
+
+    if (value === "Invalid / Unclear") {
+      return (
+        <span
+          className="status-pill compliance-status-pill unclear"
+          aria-label="غير واضح أو غير صالح"
+          title="غير واضح أو غير صالح"
+        >
+          <span aria-hidden="true">?</span>
+        </span>
+      );
+    }
+
     return value;
   };
 
@@ -1256,6 +1864,14 @@ function ComplianceReportSection({ review }: { review: LlmReview }) {
     if (value === "Mismatch") return "غير متطابق";
     if (value === "Missing") return "مفقود";
     return value;
+  };
+
+  const formatDataConsistencyCell = (value: string) => {
+    const normalized = String(value || "").trim();
+    if (!normalized || normalized === "Missing") {
+      return "غير مثبت";
+    }
+    return normalized;
   };
 
   const formatAttachmentAccuracyStatus = (value: string) => {
@@ -1300,10 +1916,6 @@ function ComplianceReportSection({ review }: { review: LlmReview }) {
           <h4>1. معلومات المشروع</h4>
           <ul>
             <li>نوع المشروع: {report.projectInformation.projectType}</li>
-            <li>
-              مستوى الثقة:{" "}
-              {formatConfidenceLevel(report.projectInformation.confidenceLevel)}
-            </li>
           </ul>
         </div>
 
@@ -1338,9 +1950,11 @@ function ComplianceReportSection({ review }: { review: LlmReview }) {
               <tbody>
                 {report.attachmentsStatus.rows.map((row) => (
                   <tr key={row.attachment}>
-                    <td>{row.attachment}</td>
-                    <td>{formatAttachmentStatus(row.status)}</td>
-                    <td>{row.notes}</td>
+                    <td data-label="المرفق">{row.attachment}</td>
+                    <td data-label="الحالة">
+                      {renderAttachmentStatusBadge(row.status)}
+                    </td>
+                    <td data-label="الملاحظات">{row.notes}</td>
                   </tr>
                 ))}
               </tbody>
@@ -1365,10 +1979,12 @@ function ComplianceReportSection({ review }: { review: LlmReview }) {
               <tbody>
                 {report.dataConsistencyCheck.map((row) => (
                   <tr key={row.field}>
-                    <td>{formatFieldLabel(row.field)}</td>
-                    <td>{row.sak}</td>
-                    <td>{row.otherDocs}</td>
-                    <td>{formatDataConsistencyStatus(row.status)}</td>
+                    <td data-label="الحقل">{formatFieldLabel(row.field)}</td>
+                    <td data-label="الصك">{formatDataConsistencyCell(row.sak)}</td>
+                    <td data-label="المستندات الأخرى">
+                      {formatDataConsistencyCell(row.otherDocs)}
+                    </td>
+                    <td data-label="الحالة">{formatDataConsistencyStatus(row.status)}</td>
                   </tr>
                 ))}
               </tbody>
@@ -1376,38 +1992,13 @@ function ComplianceReportSection({ review }: { review: LlmReview }) {
           </div>
         </SmartDisclosure>
 
-        <SmartDisclosure title="4. دقة المرفقات">
-          <div className="review-card compact-card tone-neutral">
-            <p>
-              {formatAttachmentAccuracyStatus(report.attachmentAccuracy.status)}
-            </p>
-            <h5>ملاحظات:</h5>
-            {report.attachmentAccuracy.notes.length > 0 ? (
-              <ul>
-                {report.attachmentAccuracy.notes.map((note) => (
-                  <li key={note}>{note}</li>
-                ))}
-              </ul>
-            ) : null}
-          </div>
-        </SmartDisclosure>
-
         <SmartDisclosure
           title="5. الامتثال المعماري"
-          count={report.architecturalCompliance.notesForCheck.length}
+          count={architecturalRows.length}
           defaultOpen
         >
           <div className="review-card compact-card tone-neutral">
-            <h5>5.1 الامتثال للاشتراطات:</h5>
-            <p>
-              {formatRequirementsStatus(
-                report.architecturalCompliance.requirementsCompliance,
-              )}
-            </p>
-          </div>
-
-          <div className="review-card compact-card tone-neutral">
-            <h5>5.2 عناصر التدقيق:</h5>
+            <h5>5.1 عناصر التدقيق:</h5>
           </div>
           <div className="table-scroll">
             <table className="compliance-table">
@@ -1419,11 +2010,11 @@ function ComplianceReportSection({ review }: { review: LlmReview }) {
                 </tr>
               </thead>
               <tbody>
-                {report.architecturalCompliance.notesForCheck.map((row) => (
+                {architecturalRows.map((row) => (
                   <tr key={`${row.item}-${row.comment}`}>
-                    <td>{row.item}</td>
-                    <td>{formatChecklistStatus(row.status)}</td>
-                    <td>{row.comment}</td>
+                    <td data-label="العنصر">{row.item}</td>
+                    <td data-label="الحالة">{formatChecklistStatus(row.status)}</td>
+                    <td data-label="التعليق">{row.comment}</td>
                   </tr>
                 ))}
               </tbody>
@@ -1433,10 +2024,10 @@ function ComplianceReportSection({ review }: { review: LlmReview }) {
           <div className="review-card compact-card tone-warning">
             <h5>5.3 المخالفات:</h5>
             <ul>
-              {report.architecturalCompliance.violations.map((item) => (
+              {architecturalViolations.map((item) => (
                 <li key={item}>{item}</li>
               ))}
-              {report.architecturalCompliance.violations.length === 0 ? (
+              {architecturalViolations.length === 0 ? (
                 <li>لم يتم العثور على مخالفات مؤكدة ضمن الأدلة الحالية.</li>
               ) : null}
             </ul>
@@ -1448,18 +2039,7 @@ function ComplianceReportSection({ review }: { review: LlmReview }) {
           <ul>
             <li>المرفقات: {report.finalSummary.attachments}</li>
             <li>اتساق البيانات: {report.finalSummary.dataConsistency}</li>
-            <li>
-              الامتثال المعماري: {report.finalSummary.architecturalCompliance}
-            </li>
-          </ul>
-          <h5>القضايا الرئيسية:</h5>
-          <ul>
-            {report.finalSummary.keyIssues.map((issue) => (
-              <li key={issue}>{issue}</li>
-            ))}
-            {report.finalSummary.keyIssues.length === 0 ? (
-              <li>لا توجد قضايا حرجة مسجلة.</li>
-            ) : null}
+            <li>الامتثال المعماري: {architecturalSummary}</li>
           </ul>
         </div>
       </div>
@@ -1469,11 +2049,15 @@ function ComplianceReportSection({ review }: { review: LlmReview }) {
 
 function LlmSupportContent({
   review,
+  attachments,
+  alignmentScore,
   loading,
   error,
   onPreviewSource,
 }: {
   review: LlmReview | null | undefined;
+  attachments: UploadedAttachment[];
+  alignmentScore: number;
   loading: boolean;
   error: string;
   onPreviewSource: (path: string) => void;
@@ -1500,10 +2084,10 @@ function LlmSupportContent({
               <strong>{llmDecisionLabel[review.decision]}</strong>
             </div>
             <div className="detail-card">
-              <span>مستوى الثقة</span>
-              <strong>{review.confidence}%</strong>
+              <span>مستوى المطابقة</span>
+              <strong>{alignmentScore}%</strong>
             </div>
-            <div className="detail-card">
+             <div className="detail-card">
               <span className="ai-model-label">
                 <AiAnalysisIcon className="ai-analysis-icon-xs" />
                 <span>المحرك المستخدم</span>
@@ -1517,7 +2101,7 @@ function LlmSupportContent({
             آخر توليد: {new Date(review.generatedAt).toLocaleString("ar-SA")}
           </small>
 
-          <ComplianceReportSection review={review} />
+          <ComplianceReportSection review={review} attachments={attachments} />
 
           <div className="llm-disclosures">
             <SmartDisclosure
@@ -1530,34 +2114,6 @@ function LlmSupportContent({
                 ))}
                 {review.reasoning.length === 0 ? (
                   <li>لم يعرض النموذج أسباباً إضافية.</li>
-                ) : null}
-              </ul>
-            </SmartDisclosure>
-
-            <SmartDisclosure
-              title="العناصر الناقصة"
-              count={review.missingItems.length}
-            >
-              <ul>
-                {review.missingItems.map((item) => (
-                  <li key={item}>{item}</li>
-                ))}
-                {review.missingItems.length === 0 ? (
-                  <li>لا توجد عناصر ناقصة إضافية وفق المراجعة اللغوية.</li>
-                ) : null}
-              </ul>
-            </SmartDisclosure>
-
-            <SmartDisclosure
-              title="المخاطر والقيود"
-              count={review.risks.length}
-            >
-              <ul>
-                {review.risks.map((item) => (
-                  <li key={item}>{item}</li>
-                ))}
-                {review.risks.length === 0 ? (
-                  <li>لا توجد مخاطر إضافية بارزة.</li>
                 ) : null}
               </ul>
             </SmartDisclosure>
@@ -1576,32 +2132,6 @@ function LlmSupportContent({
               </ul>
             </SmartDisclosure>
 
-            <SmartDisclosure
-              title="شواهد المراجعة"
-              count={review.evidence.length}
-            >
-              <div className="citation-stack llm-evidence-stack">
-                {review.evidence.map((item) => (
-                  <article
-                    key={`${item.label}-${item.sourcePath}-${item.excerpt}`}
-                    className="citation-item"
-                  >
-                    <strong>{item.label}</strong>
-                    <p>{item.excerpt}</p>
-                    <em>{item.relevance}</em>
-                    <FileReferenceAction
-                      path={item.sourcePath}
-                      onPreview={onPreviewSource}
-                    />
-                  </article>
-                ))}
-                {review.evidence.length === 0 ? (
-                  <div className="empty-attachments">
-                    لا توجد شواهد إضافية من مراجعة LLM.
-                  </div>
-                ) : null}
-              </div>
-            </SmartDisclosure>
           </div>
         </>
       ) : null}
@@ -1627,6 +2157,10 @@ export default function App() {
   const [analysisError, setAnalysisError] = useState("");
   const [submitError, setSubmitError] = useState("");
   const [copyStatus, setCopyStatus] = useState("");
+  const [municipalityActionStatus, setMunicipalityActionStatus] =
+    useState("");
+  const [pendingMunicipalityAction, setPendingMunicipalityAction] =
+    useState<MunicipalityActionModalState | null>(null);
   const [previewState, setPreviewState] = useState<PreviewState | null>(null);
   const [previewLoading, setPreviewLoading] = useState(false);
   const [previewError, setPreviewError] = useState("");
@@ -1748,6 +2282,15 @@ export default function App() {
         policy: scopedPolicy,
         submission: buildSubmissionFromApplication(application),
         ruleReview: application.review,
+        firstLayerArchitecturalChecklistResults:
+          getFirstLayerArchitecturalChecklistResults(
+            application.uploadedAttachments,
+          ),
+        firstLayerComplianceSnapshot: buildFirstLayerComplianceSnapshot(
+          scopedPolicy,
+          buildSubmissionFromApplication(application),
+          application.review,
+        ),
       });
 
       return { applicationId, review };
@@ -2161,6 +2704,13 @@ export default function App() {
         policy: activeScopedPolicy,
         submission: form,
         ruleReview: draftReview,
+        firstLayerArchitecturalChecklistResults:
+          getFirstLayerArchitecturalChecklistResults(form.uploadedAttachments),
+        firstLayerComplianceSnapshot: buildFirstLayerComplianceSnapshot(
+          activeScopedPolicy,
+          form,
+          draftReview,
+        ),
       });
     }, 1200);
 
@@ -2240,6 +2790,64 @@ export default function App() {
       setCopyStatus("تعذر نسخ النص المقترح تلقائياً من المتصفح الحالي.");
       window.setTimeout(() => setCopyStatus(""), 2200);
     }
+  }
+
+  function openMunicipalityActionModal(actionType: MunicipalityActionType) {
+    if (!selectedApplication) {
+      return;
+    }
+
+    const actionConfig: Record<
+      MunicipalityActionType,
+      Omit<MunicipalityActionModalState, "applicationId" | "actionType">
+    > = {
+      "request-completion": {
+        title: "تأكيد طلب الاستكمال",
+        description:
+          "سيتم تأكيد أن هذه المعاملة تحتاج إلى استكمال من المكتب الهندسي قبل المتابعة.",
+        confirmLabel: "تأكيد طلب الاستكمال",
+      },
+      "return-to-reviewer": {
+        title: "تأكيد إعادة المعاملة للمدقق",
+        description:
+          "سيتم تسجيل إعادة هذه المعاملة إلى المدقق لمراجعة الملاحظات قبل أي اعتماد.",
+        confirmLabel: "تأكيد الإعادة للمدقق",
+      },
+      "approve-final": {
+        title: "تأكيد الاعتماد النهائي",
+        description:
+          "سيتم تأكيد اتخاذ قرار الاعتماد النهائي لهذه المعاملة في الواجهة الحالية.",
+        confirmLabel: "تأكيد الاعتماد النهائي",
+      },
+    };
+
+    setPendingMunicipalityAction({
+      applicationId: selectedApplication.id,
+      actionType,
+      ...actionConfig[actionType],
+    });
+  }
+
+  function closeMunicipalityActionModal() {
+    setPendingMunicipalityAction(null);
+  }
+
+  function confirmMunicipalityAction() {
+    if (!pendingMunicipalityAction) {
+      return;
+    }
+
+    const actionOutcomeLabel: Record<MunicipalityActionType, string> = {
+      "request-completion": "طلب استكمال من المكتب",
+      "return-to-reviewer": "إعادة للمدقق",
+      "approve-final": "اعتماد نهائي",
+    };
+
+    setMunicipalityActionStatus(
+      `تم تأكيد إجراء ${actionOutcomeLabel[pendingMunicipalityAction.actionType]} للمعاملة ${pendingMunicipalityAction.applicationId}.`,
+    );
+    setPendingMunicipalityAction(null);
+    window.setTimeout(() => setMunicipalityActionStatus(""), 2600);
   }
 
   async function openSourcePreview(path: string) {
@@ -3180,6 +3788,8 @@ export default function App() {
                 <small>{draftReview.nextStep}</small>
                 <LlmSupportContent
                   review={draftLlmMutation.data}
+                  attachments={form.uploadedAttachments}
+                  alignmentScore={draftReview.score}
                   loading={draftLlmMutation.isPending}
                   error={
                     draftLlmMutation.error instanceof Error
@@ -3474,9 +4084,16 @@ export default function App() {
                   <div className="review-card tone-neutral review-card-full-span">
                     <h3>ملخص المراجعة المساندة</h3>
                     <p>{selectedApplication.review.summary}</p>
-                    <small>{selectedApplication.review.nextStep}</small>
+                    <small>خلاصة مختصرة مبنية على نتيجة الفحص الأول.</small>
+                    <p className="review-missing-inline">
+                      {selectedApplication.review.missingDocuments.length > 0
+                        ? "الملف يحتاج استكمال المرفقات الناقصة الظاهرة في الفحص الأول."
+                        : "لا توجد نواقص أساسية إضافية في هذه المرحلة."}
+                    </p>
                     <LlmSupportContent
                       review={selectedApplication.llmReview}
+                      attachments={selectedApplication.uploadedAttachments}
+                      alignmentScore={selectedApplication.review.score}
                       loading={
                         applicationLlmMutation.isPending &&
                         applicationLlmMutation.variables?.applicationId ===
@@ -3687,12 +4304,34 @@ export default function App() {
                 </div>
 
                 <div className="action-row">
-                  <button className="secondary-button">
+                  <button
+                    className="secondary-button"
+                    onClick={() =>
+                      openMunicipalityActionModal("request-completion")
+                    }
+                  >
                     طلب استكمال من المكتب
                   </button>
-                  <button className="secondary-button">إعادة للمدقق</button>
-                  <button className="primary-button">اعتماد نهائي</button>
+                  <button
+                    className="secondary-button"
+                    onClick={() =>
+                      openMunicipalityActionModal("return-to-reviewer")
+                    }
+                  >
+                    إعادة للمدقق
+                  </button>
+                  <button
+                    className="primary-button"
+                    onClick={() => openMunicipalityActionModal("approve-final")}
+                  >
+                    اعتماد نهائي
+                  </button>
                 </div>
+                {municipalityActionStatus ? (
+                  <div className="upload-status success municipality-action-status">
+                    {municipalityActionStatus}
+                  </div>
+                ) : null}
               </>
             ) : (
               <div className="empty-attachments">
@@ -3832,6 +4471,58 @@ export default function App() {
                 {previewState.message || "المعاينة غير متاحة لهذا الملف."}
               </div>
             ) : null}
+          </div>
+        </div>
+      ) : null}
+
+      {pendingMunicipalityAction ? (
+        <div
+          className="modal-backdrop"
+          onClick={closeMunicipalityActionModal}
+          role="presentation"
+        >
+          <div
+            className="confirmation-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-label={pendingMunicipalityAction.title}
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div className="preview-modal-header confirmation-modal-header">
+              <div>
+                <strong>{pendingMunicipalityAction.title}</strong>
+                <small>
+                  المعاملة: {pendingMunicipalityAction.applicationId}
+                </small>
+              </div>
+              <button
+                type="button"
+                className="ghost-button"
+                onClick={closeMunicipalityActionModal}
+              >
+                إلغاء
+              </button>
+            </div>
+
+            <div className="confirmation-modal-body">
+              <p>{pendingMunicipalityAction.description}</p>
+              <div className="confirmation-modal-actions">
+                <button
+                  type="button"
+                  className="ghost-button"
+                  onClick={closeMunicipalityActionModal}
+                >
+                  رجوع
+                </button>
+                <button
+                  type="button"
+                  className="primary-button"
+                  onClick={confirmMunicipalityAction}
+                >
+                  {pendingMunicipalityAction.confirmLabel}
+                </button>
+              </div>
+            </div>
           </div>
         </div>
       ) : null}

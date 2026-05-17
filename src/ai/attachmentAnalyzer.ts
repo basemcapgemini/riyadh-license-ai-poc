@@ -187,6 +187,42 @@ function normalizeExtractedText(text: string): string {
     .trim();
 }
 
+function normalizeIndicDigits(value: string) {
+  return String(value)
+    .replace(/[\u0660-\u0669]/g, (digit) => String(digit.charCodeAt(0) - 0x0660))
+    .replace(/[\u06F0-\u06F9]/g, (digit) => String(digit.charCodeAt(0) - 0x06f0));
+}
+
+function cleanFieldValue(value: string) {
+  return normalizeExtractedText(value)
+    .replace(/^[\s:;،,.\-|]+/u, "")
+    .replace(/[\s|]+$/u, "")
+    .trim();
+}
+
+function extractDeedNumberFromText(text: string) {
+  const normalizedText = normalizeIndicDigits(normalizeExtractedText(text));
+  if (!normalizedText) {
+    return "";
+  }
+
+  const labelPattern =
+    /(?:رقم\s*(?:الوثيقة|الصك|سند الملكية|الهوية العقارية)|الوثيقة\s*رقم|الصك\s*رقم|وثيقة\s*رقم|الرقم)\s*(?:[:：#-]?\s*)?([0-9]{8,20})/iu;
+  const directMatch = normalizedText.match(labelPattern);
+  if (directMatch?.[1]) {
+    return cleanFieldValue(directMatch[1]);
+  }
+
+  const reversePattern =
+    /([0-9]{8,20})\s*(?:[:：#-]?\s*)?(?:رقم\s*(?:الوثيقة|الصك|سند الملكية|الهوية العقارية)|الوثيقة\s*رقم|الصك\s*رقم|وثيقة\s*رقم|الرقم)/iu;
+  const reverseMatch = normalizedText.match(reversePattern);
+  if (reverseMatch?.[1]) {
+    return cleanFieldValue(reverseMatch[1]);
+  }
+
+  return "";
+}
+
 function createProgressReporter(
   onProgress?: AnalyzeAttachmentsOptions["onProgress"],
 ): ProgressReporter {
@@ -275,6 +311,32 @@ function hasMeaningfulPdfText(text: string): boolean {
 
 function hasSufficientAttachmentText(text: string): boolean {
   return normalizeExtractedText(text).length >= 600;
+}
+
+function isArchitecturalPdfCandidate(
+  fileName: string,
+  localDetectedDocuments: string[],
+): boolean {
+  const normalizedFileName = normalizeArabic(fileName || "");
+
+  if (
+    normalizedFileName.includes(normalizeArabic("المخططات المعمارية")) ||
+    normalizedFileName.includes(normalizeArabic("مخطط معماري")) ||
+    normalizedFileName.includes(normalizeArabic("معمار")) ||
+    normalizedFileName.includes(normalizeArabic("مخططات")) ||
+    normalizedFileName.includes("architectural")
+  ) {
+    return true;
+  }
+
+  return localDetectedDocuments.some((documentName) => {
+    const normalizedDocumentName = normalizeArabic(documentName || "");
+    return (
+      normalizedDocumentName.includes(normalizeArabic("المخططات المعمارية")) ||
+      normalizedDocumentName.includes(normalizeArabic("مخطط معماري")) ||
+      normalizedDocumentName.includes("architectural")
+    );
+  });
 }
 
 async function renderPdfPageToDataUrl(
@@ -492,12 +554,19 @@ async function ensurePdfPageTexts(
 function shouldRunAiForPdf(
   pages: string[],
   localDetectedDocuments: string[],
+  fileName: string,
 ): boolean {
   const weakPagesCount = pages.filter(
     (pageText) => !hasMeaningfulPdfText(pageText),
   ).length;
   const weakPagesRatio = pages.length > 0 ? weakPagesCount / pages.length : 1;
   const combinedText = normalizeExtractedText(pages.join("\n\n"));
+
+  // Architectural drawings carry visual-only checklist evidence such as parking,
+  // setbacks, room layouts, and usage labels that embedded PDF text often misses.
+  if (isArchitecturalPdfCandidate(fileName, localDetectedDocuments)) {
+    return true;
+  }
 
   if (!hasSufficientAttachmentText(combinedText)) {
     return true;
@@ -866,7 +935,7 @@ async function readPdf(
   const localDetection = detectDocuments(policy, extractedText, file.name);
   if (
     !fastCadCandidate &&
-    !shouldRunAiForPdf(pages, localDetection.detectedDocuments)
+    !shouldRunAiForPdf(pages, localDetection.detectedDocuments, file.name)
   ) {
     reportProgress({
       operationKey: `ai-overall-${file.name}`,
@@ -1242,9 +1311,94 @@ function normalizeBasicFields(value: Partial<BasicFormFields> | undefined) {
     officeLicense: String(source.officeLicense || "").trim(),
     district: String(source.district || "").trim(),
     plotNumber: String(source.plotNumber || "").trim(),
+    deedNumber: String(source.deedNumber || "").trim(),
   };
 
   return Object.values(normalized).some(Boolean) ? normalized : undefined;
+}
+
+function extractDeedBasicFieldsFromText(text: string): Partial<BasicFormFields> {
+  const normalizedText = normalizeIndicDigits(normalizeExtractedText(text));
+  if (!normalizedText) {
+    return {};
+  }
+
+  const lines = normalizedText
+    .split(/\r?\n/)
+    .map((line) => cleanFieldValue(line))
+    .filter(Boolean);
+  const joined = lines.join("\n");
+  const compact = normalizeArabic(joined);
+
+  const deedNumberMatch =
+    joined.match(
+      /(?:رقم\s*(?:الوثيقة|الصك|سند الملكية|الهوية العقارية)|الوثيقة\s*رقم|الصك\s*رقم|وثيقة\s*رقم|الرقم)\s*(?:[:：#-]?\s*)?([0-9]{8,20})/iu,
+    ) ||
+    joined.match(
+      /([0-9]{8,20})\s*(?:[:：#-]?\s*)?(?:رقم\s*(?:الوثيقة|الصك|سند الملكية|الهوية العقارية)|الوثيقة\s*رقم|الصك\s*رقم|وثيقة\s*رقم|الرقم)/iu,
+    );
+  const deedNumber = deedNumberMatch?.[1] ? cleanFieldValue(deedNumberMatch[1]) : "";
+
+  const nationalIdMatch =
+    joined.match(/(?:^|[\s|])([0-9]{10})(?:[\s|]|$)/u) ||
+    joined.match(/(?:الهوية|السجل|رقم الهوية)\s*(?:[:：#-]?\s*)?([0-9]{10})/iu);
+  const nationalId = nationalIdMatch?.[1] ? cleanFieldValue(nationalIdMatch[1]) : "";
+
+  const plotNumberMatch =
+    joined.match(/(?:رقم\s*(?:القطعة|المخطط)|القطعة\s*رقم|المخطط\s*رقم)\s*(?:[:：#-]?\s*)?([0-9]{1,6})(?:\b|$)/iu) ||
+    joined.match(/([0-9]{1,6})\s*(?:[:：#-]?\s*)?(?:رقم\s*(?:القطعة|المخطط)|القطعة\s*رقم|المخطط\s*رقم)/iu);
+  const plotNumber = plotNumberMatch?.[1] ? cleanFieldValue(plotNumberMatch[1]) : "";
+
+  const districtMatch =
+    joined.match(/(?:الحي|المدينة|المدينه)\s*(?:[:：#-]?\s*)?([^\n\r|]{2,20}?)(?=\s*(?:رقم\s*(?:القطعة|المخطط)|الرقم|المساحة|نوع\s*المخطط|نوع\s*العقار|$))/iu) ||
+    joined.match(/([^\n\r|]{2,20}?)\s*(?:[:：#-]?\s*)?(?:الحي|المدينة|المدينه)/iu);
+  const district = districtMatch?.[1] ? cleanFieldValue(districtMatch[1]) : "";
+
+  let applicantName = "";
+  const nameMatch =
+    joined.match(/(?:الاسم)\s*(?:[:：#-]?\s*)?(?:[0-9]{10}\s*)?([^\d\n\r|]{4,40}?)(?=\s*(?:سعودي|سعودية|الجنسية|نسبة|الحي|رقم|$))/iu) ||
+    joined.match(/(?:[0-9]{10}\s+)([^\d\n\r|]{4,40}?)(?=\s*(?:سعودي|سعودية|الجنسية|نسبة|الحي|رقم|$))/iu);
+  if (nameMatch?.[1]) {
+    applicantName = cleanFieldValue(nameMatch[1]);
+  }
+
+  const fields: Partial<BasicFormFields> = {};
+  if (applicantName) {
+    fields.applicantName = applicantName;
+  }
+  if (nationalId) {
+    fields.nationalId = nationalId;
+  }
+  if (district) {
+    fields.district = district;
+  }
+  if (plotNumber) {
+    fields.plotNumber = plotNumber;
+  }
+  if (deedNumber) {
+    fields.deedNumber = deedNumber;
+  }
+
+  return fields;
+}
+
+function prefersDeedNumber(candidate: string) {
+  return /^[0-9]{8,20}$/u.test(candidate);
+}
+
+function prefersNationalId(candidate: string) {
+  return /^[0-9]{10}$/u.test(candidate);
+}
+
+function prefersPlotNumber(candidate: string) {
+  return /^[0-9]{1,6}[A-Za-zأ-ي]?(?:\s*\/\s*[A-Za-zأ-ي])?$/u.test(candidate);
+}
+
+function preferTextValue(current: string, fallback: string, checker: (value: string) => boolean) {
+  if (checker(current)) {
+    return current;
+  }
+  return checker(fallback) ? fallback : current || fallback;
 }
 
 function isLikelyDeedImage(file: File, extractedText: string) {
@@ -1281,9 +1435,41 @@ async function extractBasicFieldsFromImage(file: File, extractedText: string) {
       pageImages,
     });
 
-    return normalizeBasicFields(extractionResult.basicFields);
+    const basicFields = normalizeBasicFields(extractionResult.basicFields);
+    const textFallbackFields = extractDeedBasicFieldsFromText(extractedText);
+    const mergedFields = normalizeBasicFields({
+      applicantName: preferTextValue(
+        basicFields?.applicantName || "",
+        textFallbackFields.applicantName || "",
+        (value) => Boolean(value) && !/[0-9]/u.test(value),
+      ),
+      nationalId: preferTextValue(
+        basicFields?.nationalId || "",
+        textFallbackFields.nationalId || "",
+        prefersNationalId,
+      ),
+      officeName: basicFields?.officeName || "",
+      officeLicense: basicFields?.officeLicense || "",
+      district: preferTextValue(
+        basicFields?.district || "",
+        textFallbackFields.district || "",
+        (value) => Boolean(value) && !/[0-9]/u.test(value),
+      ),
+      plotNumber: preferTextValue(
+        basicFields?.plotNumber || "",
+        textFallbackFields.plotNumber || "",
+        prefersPlotNumber,
+      ),
+      deedNumber: preferTextValue(
+        basicFields?.deedNumber || "",
+        textFallbackFields.deedNumber || "",
+        prefersDeedNumber,
+      ),
+    });
+    return mergedFields;
   } catch {
-    return undefined;
+    const textFallbackFields = extractDeedBasicFieldsFromText(extractedText);
+    return normalizeBasicFields(textFallbackFields);
   }
 }
 

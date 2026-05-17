@@ -1,4 +1,6 @@
 import type {
+  AttachmentChecklistResult,
+  FirstLayerComplianceSnapshot,
   LicensePolicy,
   LlmReview,
   ReviewResult,
@@ -10,6 +12,8 @@ export async function requestLlmReview(input: {
   policy: LicensePolicy;
   submission: SubmissionForm;
   ruleReview: ReviewResult;
+  firstLayerArchitecturalChecklistResults?: AttachmentChecklistResult[];
+  firstLayerComplianceSnapshot?: FirstLayerComplianceSnapshot;
 }): Promise<LlmReview> {
   return fetchJson<LlmReview>(
     "/api/llm-review",

@@ -33,9 +33,19 @@ function buildSmartArchitecturalChecklistResults(userPayload) {
   const hasParking =
     sourceText.includes("مواقف السيارات") ||
     sourceText.includes("مواقف مرسومة") ||
+    sourceText.includes("صفوف مواقف") ||
     sourceText.includes("صف مواقف") ||
     sourceText.includes("parking") ||
+    sourceText.includes("parking layout") ||
+    sourceText.includes("parking area") ||
+    sourceText.includes("parking bays") ||
+    sourceText.includes("parking stalls") ||
+    sourceText.includes("car slots") ||
+    sourceText.includes("car symbols") ||
+    sourceText.includes("aisle arrows") ||
     sourceText.includes("garage") ||
+    sourceText.includes("منطقة مواقف") ||
+    sourceText.includes("منطقة حركة سيارات") ||
     sourceText.includes("منحدر سيارات") ||
     sourceText.includes("مدخل سيارة");
   const hasAccessibility =
@@ -1548,16 +1558,105 @@ describe("review server", () => {
           ],
         },
         ruleReview: {
+          status: "ready",
+          summary:
+            "الملف شبه مكتمل ويمكن إحالة المعاملة للمشرف مع تدقيق نهائي سريع.",
           matchedDocuments: ["مخطط الموقع المعتمد"],
           missingDocuments: [],
           policyAlerts: [],
+          nextStep: "إحالة إلى المشرف للاعتماد النهائي مع الاحتفاظ بتوصية الذكاء الاصطناعي في الملف.",
+          suggestedResponses: [
+            {
+              actionType: "escalate-to-supervisor",
+              title: "إحالة إلى المشرف",
+              text: "تمت مراجعة الملف وهو جاهز للإحالة مع تدقيق نهائي سريع.",
+              rationale: "يحتاج إلى إنهاء المراجعة الإشرافية النهائية فقط.",
+            },
+          ],
+        },
+        firstLayerArchitecturalChecklistResults: [
+          {
+            item: "مطابقة الواجهة المعمارية",
+            status: "Compliant",
+            comment: "الواجهة المعمارية مطابقة لما ظهر في تحليل الطبقة الأولى.",
+          },
+          {
+            item: "مطابقة أبعاد الارتدادات",
+            status: "Non-Compliant",
+            comment: "الارتداد الجانبي غير مطابق حسب تحليل الطبقة الأولى.",
+          },
+        ],
+        firstLayerComplianceSnapshot: {
+          projectInformation: {
+            projectType: "فلل سكنية / سكني",
+            confidenceLevel: "High",
+          },
+          attachmentsStatus: {
+            overallStatus: "Incomplete",
+            rows: [
+              {
+                attachment: "المرفقات الأساسية",
+                status: "Present",
+                notes: "تم جلب حالة المرفقات من الطبقة الأولى مباشرة.",
+                sourceRefs: ["first-layer"],
+              },
+            ],
+          },
+          dataConsistencyCheck: [
+            {
+              field: "Plot Number",
+              sak: "12/أ",
+              otherDocs: "12/أ",
+              status: "Match",
+              sourceRefs: ["first-layer-plot"],
+            },
+            {
+              field: "Beneficiary Name",
+              sak: "شركة الاختبار",
+              otherDocs: "شركة الاختبار",
+              status: "Match",
+              sourceRefs: ["first-layer-beneficiary"],
+            },
+          ],
+          attachmentAccuracy: {
+            status: "Partially Valid",
+            notes: ["تم جلب دقة المرفقات من الطبقة الأولى مباشرة."],
+          },
+          architecturalCompliance: {
+            requirementsCompliance: "Not Compliant",
+            notesForCheck: [
+              {
+                item: "مطابقة الواجهة المعمارية",
+                status: "Compliant",
+                comment: "الواجهة المعمارية مطابقة لما ظهر في تحليل الطبقة الأولى.",
+                sourceRefs: ["first-layer-architecture"],
+              },
+              {
+                item: "مطابقة أبعاد الارتدادات",
+                status: "Non-Compliant",
+                comment: "الارتداد الجانبي غير مطابق حسب تحليل الطبقة الأولى.",
+                sourceRefs: ["first-layer-architecture"],
+              },
+            ],
+            violations: [
+              "مطابقة أبعاد الارتدادات: الارتداد الجانبي غير مطابق حسب تحليل الطبقة الأولى.",
+            ],
+          },
+          finalSummary: {
+            attachments: "تم تلخيص المرفقات من الطبقة الأولى.",
+            dataConsistency: "تم تلخيص الاتساق من الطبقة الأولى.",
+            architecturalCompliance: "تم تلخيص الامتثال المعماري من الطبقة الأولى.",
+            keyIssues: ["هذه القضايا الرئيسية جاءت من الطبقة الأولى."],
+          },
         },
       });
 
     expect(response.status).toBe(200);
     expect(response.body.model).toBe("gpt-test");
-    expect(response.body.decision).toBe("needs-more-info");
-    expect(response.body.summary).toContain("المعاملة");
+    expect(response.body.decision).toBe("approve-with-human-check");
+    expect(response.body.summary).toBe(
+      "الملف مكتمل مبدئياً.",
+    );
     expect(response.body.evidence).toHaveLength(1);
     expect(response.body.evidence[0].sourcePath).toBe("/tmp/policy.docx");
     expect(response.body.documentValidations).toHaveLength(1);
@@ -1607,75 +1706,88 @@ describe("review server", () => {
     });
     expect(response.body.complianceReport.attachmentsStatus.rows).toEqual([
       {
-        attachment: "مخطط الموقع المعتمد",
+        attachment: "المرفقات الأساسية",
         status: "Present",
-        notes: "تم رصد هذا المرفق ضمن الملفات المرفوعة.",
-        sourceRefs: [],
-      },
-      {
-        attachment: "المخطط الإنشائي",
-        status: "Missing",
-        notes: "هذا المرفق مفقود ويجب استكماله.",
-        sourceRefs: [],
+        notes: "تم جلب حالة المرفقات من الطبقة الأولى مباشرة.",
+        sourceRefs: ["first-layer"],
       },
     ]);
-    expect(response.body.complianceReport.dataConsistencyCheck).toHaveLength(7);
+    expect(response.body.complianceReport.attachmentsStatus.overallStatus).toBe(
+      "Incomplete",
+    );
+    expect(response.body.complianceReport.architecturalCompliance.notesForCheck).toEqual(
+      [
+        {
+          item: "مطابقة الواجهة المعمارية",
+          status: "Compliant",
+          comment: "الواجهة المعمارية مطابقة لما ظهر في تحليل الطبقة الأولى.",
+          sourceRefs: ["first-layer-architecture"],
+        },
+        {
+          item: "مطابقة أبعاد الارتدادات",
+          status: "Non-Compliant",
+          comment: "الارتداد الجانبي غير مطابق حسب تحليل الطبقة الأولى.",
+          sourceRefs: ["first-layer-architecture"],
+        },
+      ],
+    );
     expect(
-      response.body.complianceReport.dataConsistencyCheck.map(
-        (row) => row.field,
-      ),
-    ).toEqual([
-      "Plot Number",
-      "Beneficiary Name",
-      "Engineering Office",
-      "Plan Number",
-      "Deed Number",
-      "مطابقة الاستخدام بين (الصك . الرخصة السابقة . نظام البناء)",
-      "مطابقة المساحات بين ( التقرير الفني . المخطط المعماري .النظام الإلكتروني)",
+      response.body.complianceReport.architecturalCompliance
+        .requirementsCompliance,
+    ).toBe("Not Compliant");
+    expect(response.body.complianceReport.architecturalCompliance.violations).toEqual(
+      [
+        "مطابقة أبعاد الارتدادات: الارتداد الجانبي غير مطابق حسب تحليل الطبقة الأولى.",
+      ],
+    );
+    expect(response.body.complianceReport.dataConsistencyCheck).toEqual([
+      {
+        field: "Plot Number",
+        otherDocs: "12/أ",
+        sak: "12/أ",
+        sourceRefs: ["first-layer-plot"],
+        status: "Match",
+      },
+      {
+        field: "Beneficiary Name",
+        otherDocs: "شركة الاختبار",
+        sak: "شركة الاختبار",
+        sourceRefs: ["first-layer-beneficiary"],
+        status: "Match",
+      },
     ]);
-    expect(
-      response.body.complianceReport.architecturalCompliance.notesForCheck,
-    ).toHaveLength(5);
+    expect(response.body.complianceReport.attachmentAccuracy).toEqual({
+      status: "Partially Valid",
+      notes: ["تم جلب دقة المرفقات من الطبقة الأولى مباشرة."],
+    });
     expect(
       response.body.complianceReport.architecturalCompliance.notesForCheck,
     ).toEqual([
       {
-        item: "الارتدادات النظامية",
-        status: "Not Found",
-        comment: "لم يتم العثور على دليل صريح لهذا البند داخل الملف الحالي.",
-        sourceRefs: ["/tmp/notes-for-check.xlsx"],
+        item: "مطابقة الواجهة المعمارية",
+        status: "Compliant",
+        comment: "الواجهة المعمارية مطابقة لما ظهر في تحليل الطبقة الأولى.",
+        sourceRefs: ["first-layer-architecture"],
       },
       {
-        item: "نسبة البناء",
-        status: "Not Found",
-        comment: "لم يتم العثور على دليل صريح لهذا البند داخل الملف الحالي.",
-        sourceRefs: ["/tmp/notes-for-check.xlsx"],
-      },
-      {
-        item: "مواقف السيارات",
-        status: "Not Found",
-        comment: "لم يتم العثور على دليل صريح لهذا البند داخل الملف الحالي.",
-        sourceRefs: ["/tmp/notes-for-check.xlsx"],
-      },
-      {
-        item: "متطلبات ذوي الإعاقة (إن وجد)",
-        status: "Not Found",
-        comment: "لم يتم العثور على دليل صريح لهذا البند داخل الملف الحالي.",
-        sourceRefs: ["/tmp/notes-for-check.xlsx"],
-      },
-      {
-        item: "عدد الأدوار والارتفاع",
-        status: "Not Found",
-        comment: "لم يتم العثور على دليل صريح لهذا البند داخل الملف الحالي.",
-        sourceRefs: ["/tmp/notes-for-check.xlsx"],
+        item: "مطابقة أبعاد الارتدادات",
+        status: "Non-Compliant",
+        comment: "الارتداد الجانبي غير مطابق حسب تحليل الطبقة الأولى.",
+        sourceRefs: ["first-layer-architecture"],
       },
     ]);
     expect(response.body.complianceReport.finalSummary.attachments).toBe(
-      "مفقود (المخطط الإنشائي)",
+      "تم تلخيص المرفقات من الطبقة الأولى.",
     );
     expect(
       response.body.complianceReport.finalSummary.architecturalCompliance,
-    ).toBe("غير متوافق");
+    ).toBe("تم تلخيص الامتثال المعماري من الطبقة الأولى.");
+    expect(response.body.complianceReport.finalSummary.dataConsistency).toBe(
+      "تم تلخيص الاتساق من الطبقة الأولى.",
+    );
+    expect(response.body.complianceReport.finalSummary.keyIssues).toEqual([
+      "هذه القضايا الرئيسية جاءت من الطبقة الأولى.",
+    ]);
   });
 
   test("attachment extraction endpoint returns mapped document hints", async () => {
@@ -1812,8 +1924,37 @@ describe("review server", () => {
       officeLicense: "",
       district: "السلي",
       plotNumber: "123",
+      deedNumber: "",
     });
     expect(response.body.status).toBe("passed");
+  });
+
+  test("attachment validation endpoint derives deed number from ownership labels", async () => {
+    const app = await createTestApp();
+    const response = await request(app)
+      .post("/api/validate-attachment")
+      .send({
+        fileName: "deed-number.png",
+        mimeType: "image/png",
+        sourceType: "image",
+        requiredDocuments: ["صورة الصك"],
+        expectedDocument: "صورة الصك",
+        extractedText:
+          "وثيقة تملك عقار\nالرقم: 852147009876\nالاسم محمد عبدالله علي الدوسري\nالحي السلي",
+        detectedDocuments: ["صورة الصك"],
+        notes: ["تم التعرف على البيانات الأساسية في وثيقة الصك."],
+      });
+
+    expect(response.status).toBe(200);
+    expect(response.body.basicFields).toEqual({
+      applicantName: "محمد عبدالله علي الدوسري",
+      nationalId: "1234567890",
+      officeName: "",
+      officeLicense: "",
+      district: "السلي",
+      plotNumber: "123",
+      deedNumber: "852147009876",
+    });
   });
 
   test("attachment validation endpoint synthesizes feedback when model response is incomplete", async () => {
@@ -2034,6 +2175,36 @@ describe("review server", () => {
         comment: "لم يتم العثور على دليل صريح لهذا البند داخل الملف الحالي.",
       },
     ]);
+  });
+
+  test("architectural attachment validation treats page-3 parking layout cues as parking evidence", async () => {
+    const app = await createTestApp();
+    const response = await request(app)
+      .post("/api/validate-attachment")
+      .send({
+        fileName: "architectural-page3-parking.pdf",
+        mimeType: "application/pdf",
+        sourceType: "pdf",
+        requiredDocuments: ["48 - المخططات المعمارية"],
+        expectedDocument: "48 - المخططات المعمارية",
+        extractedText:
+          "الصفحة 3: parking layout with parking bays, stall rows, aisle arrows, and car symbols near the side entrance.",
+        detectedDocuments: ["48 - المخططات المعمارية"],
+        notes: [
+          "الصفحة 3 تحتوي على parking area واضحة مع صفوف مواقف ومنطقة حركة سيارات.",
+        ],
+      });
+
+    expect(response.status).toBe(200);
+    const parkingRow = response.body.checklistResults.find(
+      (row) => row.item === "مواقف السيارات",
+    );
+    expect(parkingRow).toEqual({
+      item: "مواقف السيارات",
+      status: "Compliant",
+      comment:
+        "تم رصد توزيع أو رموز مواقف سيارات داخل المخطط ويُعتمد ذلك كدليل على تحقق بند مواقف السيارات حتى لو لم يظهر العنوان نصاً.",
+    });
   });
 
   test("architectural attachment validation treats setbacks table titles as setbacks evidence", async () => {

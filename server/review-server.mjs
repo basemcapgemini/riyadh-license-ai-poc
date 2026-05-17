@@ -631,6 +631,7 @@ function extractSnippet(sourceText, searchTerms, radius = 140) {
 function compactAttachments(attachments) {
   return attachments.map((attachment) => ({
     name: attachment.name,
+    requiredDocument: attachment.requiredDocument,
     sourceType: attachment.sourceType,
     detectedDocuments: attachment.detectedDocuments,
     detectedDocumentsDetailed: attachment.detectedDocuments.map(
@@ -641,6 +642,28 @@ function compactAttachments(attachments) {
     ),
     notes: attachment.notes,
     extractedText: String(attachment.extractedText || "").slice(0, 3500),
+    basicFields: attachment.basicFields
+      ? {
+          applicantName: String(attachment.basicFields.applicantName || "").trim(),
+          nationalId: String(attachment.basicFields.nationalId || "").trim(),
+          officeName: String(attachment.basicFields.officeName || "").trim(),
+          officeLicense: String(attachment.basicFields.officeLicense || "").trim(),
+          district: String(attachment.basicFields.district || "").trim(),
+          plotNumber: String(attachment.basicFields.plotNumber || "").trim(),
+          deedNumber: String(attachment.basicFields.deedNumber || "").trim(),
+        }
+      : undefined,
+    aiValidation: attachment.aiValidation
+      ? {
+          checklistResults: Array.isArray(attachment.aiValidation.checklistResults)
+            ? attachment.aiValidation.checklistResults.map((row) => ({
+                item: normalizeText(row.item, 160),
+                status: normalizeText(row.status, 40),
+                comment: normalizeText(row.comment, 320),
+              }))
+            : [],
+        }
+      : undefined,
   }));
 }
 
@@ -800,8 +823,64 @@ function normalizeBasicFieldValue(value, maxLength = 120) {
   return normalizeText(value, maxLength);
 }
 
-function normalizeBasicFieldSet(value) {
+function extractDeedNumberFromText(text) {
+  const normalizedText = normalizeIndicDigits(normalizeText(text, 6000));
+  if (!normalizedText) {
+    return "";
+  }
+
+  const structuredAliases = [
+    "رقم الوثيقة",
+    "رقم الصك",
+    "الصك رقم",
+    "وثيقة رقم",
+    "رقم سند الملكية",
+    "رقم الهوية العقارية",
+    "رقم الهوية العقاريه",
+    "الوثيقة رقم",
+  ];
+  const structuredMatch = extractFieldValueFromText(
+    normalizedText,
+    structuredAliases,
+    { allowPrefixValue: true },
+  );
+  if (structuredMatch) {
+    return structuredMatch;
+  }
+
+  const normalizedHintText = normalizeArabic(normalizedText);
+  const hasOwnershipContext =
+    normalizedHintText.includes(normalizeArabic("وثيقة")) ||
+    normalizedHintText.includes(normalizeArabic("صك")) ||
+    normalizedHintText.includes(normalizeArabic("تملك")) ||
+    normalizedHintText.includes(normalizeArabic("عقاري"));
+  if (!hasOwnershipContext) {
+    return "";
+  }
+
+  const loosePatterns = [
+    /(?:^|[\n\r\s])(?:الرقم|رقم)\s*(?:[:：#-]?\s*)?([0-9]{8,20})(?:\b|$)/iu,
+    /([0-9]{8,20})\s*(?:[:：#-]?\s*)?(?:الرقم|رقم)(?:\b|$)/iu,
+  ];
+
+  for (const pattern of loosePatterns) {
+    const match = normalizedText.match(pattern);
+    if (match?.[1]) {
+      const candidate = cleanExtractedFieldValue(match[1]);
+      if (candidate) {
+        return candidate;
+      }
+    }
+  }
+
+  return "";
+}
+
+function normalizeBasicFieldSet(value, fallbackText = "") {
   const source = value && typeof value === "object" ? value : {};
+  const deedNumber =
+    normalizeBasicFieldValue(source.deedNumber, 48) ||
+    extractDeedNumberFromText(fallbackText);
 
   return {
     applicantName: normalizeBasicFieldValue(source.applicantName, 120),
@@ -810,6 +889,7 @@ function normalizeBasicFieldSet(value) {
     officeLicense: normalizeBasicFieldValue(source.officeLicense, 48),
     district: normalizeBasicFieldValue(source.district, 80),
     plotNumber: normalizeBasicFieldValue(source.plotNumber, 40),
+    deedNumber,
   };
 }
 
@@ -1044,6 +1124,72 @@ function normalizeValueFromSet(value, allowedValues, fallbackValue) {
   return allowedValues.includes(value) ? value : fallbackValue;
 }
 
+function deriveRuleReviewStatus(ruleReview) {
+  const status = String(ruleReview?.status || "").trim();
+  if (status === "ready" || status === "needs-info" || status === "blocked") {
+    return status;
+  }
+
+  const missingCount = Array.isArray(ruleReview?.missingDocuments)
+    ? ruleReview.missingDocuments.length
+    : 0;
+  const policyAlertCount = Array.isArray(ruleReview?.policyAlerts)
+    ? ruleReview.policyAlerts.length
+    : 0;
+
+  if (missingCount === 0 && policyAlertCount <= 1) {
+    return "ready";
+  }
+
+  if (missingCount <= 2 && policyAlertCount <= 4) {
+    return "needs-info";
+  }
+
+  return "blocked";
+}
+
+function buildBriefAlignedLlmSummary(ruleReview, policyTitle) {
+  const missingItems = normalizeStringList(ruleReview?.missingDocuments, 3);
+  const matchedItems = normalizeStringList(ruleReview?.matchedDocuments, 3);
+
+  if (missingItems.length > 0) {
+    return `الملف يحتاج استكمالاً: ${missingItems.join("، ")}.`;
+  }
+
+  if (matchedItems.length > 0) {
+    return `الملف مكتمل مبدئياً.`;
+  }
+
+  const ruleSummary = normalizeText(ruleReview?.summary, 120);
+  if (ruleSummary) {
+    return ruleSummary;
+  }
+
+  return `الملف قيد المراجعة وفق سياسة ${policyTitle}.`;
+}
+
+function buildBriefAlignedLlmBullets(ruleReview) {
+  const bullets = [];
+
+  const missingItems = Array.from(
+    new Set(
+      [
+        ...(Array.isArray(ruleReview?.missingDocuments)
+          ? ruleReview.missingDocuments
+          : []),
+      ].filter(Boolean),
+    ),
+  ).slice(0, 4);
+
+  if (missingItems.length > 0) {
+    bullets.push(`المفقود: ${missingItems.join("، ")}.`);
+  } else {
+    bullets.push(`لا توجد نواقص أساسية ظاهرة في هذه المرحلة.`);
+  }
+
+  return bullets.slice(0, 2);
+}
+
 function normalizeConfidenceLevel(value, confidence = 0) {
   if (value === "High" || value === "Medium" || value === "Low") {
     return value;
@@ -1085,11 +1231,29 @@ function buildFieldValueRegex(aliases) {
   );
 }
 
-function extractFieldValueFromText(text, aliases) {
+function buildFieldValuePrefixRegex(aliases) {
+  const aliasPattern = aliases.map((alias) => escapeRegex(alias)).join("|");
+  return new RegExp(
+    `([^\\n\\r|]{1,100})\\s*(?:رقم\\s*)?(?::|：|#|-)?\\s*(?:${aliasPattern})`,
+    "iu",
+  );
+}
+
+function extractFieldValueFromText(text, aliases, options = {}) {
   const normalizedText = normalizeIndicDigits(text || "");
   const directMatch = normalizedText.match(buildFieldValueRegex(aliases));
   if (directMatch?.[1]) {
     return cleanExtractedFieldValue(directMatch[1]);
+  }
+
+  if (options.allowPrefixValue) {
+    const prefixMatch = normalizedText.match(buildFieldValuePrefixRegex(aliases));
+    if (prefixMatch?.[1]) {
+      const candidate = cleanExtractedFieldValue(prefixMatch[1]);
+      if (candidate) {
+        return candidate;
+      }
+    }
   }
 
   const lines = normalizedText.split(/\r?\n/);
@@ -1105,6 +1269,18 @@ function extractFieldValueFromText(text, aliases) {
     const fallbackMatch = line.match(buildFieldValueRegex([matchedAlias]));
     if (fallbackMatch?.[1]) {
       return cleanExtractedFieldValue(fallbackMatch[1]);
+    }
+
+    if (options.allowPrefixValue) {
+      const prefixFallbackMatch = line.match(
+        buildFieldValuePrefixRegex([matchedAlias]),
+      );
+      if (prefixFallbackMatch?.[1]) {
+        const candidate = cleanExtractedFieldValue(prefixFallbackMatch[1]);
+        if (candidate) {
+          return candidate;
+        }
+      }
     }
 
     return cleanExtractedFieldValue(line);
@@ -1126,6 +1302,8 @@ const DATA_CONSISTENCY_FIELDS = [
       "رقم القسيمة",
     ],
     submissionFallbackKey: "plotNumber",
+    allowPrefixValue: true,
+    basicFieldKey: "plotNumber",
   },
   {
     field: "Beneficiary Name",
@@ -1138,6 +1316,7 @@ const DATA_CONSISTENCY_FIELDS = [
       "المالك",
     ],
     submissionFallbackKey: "applicantName",
+    basicFieldKey: "applicantName",
   },
   {
     field: "Engineering Office",
@@ -1150,6 +1329,7 @@ const DATA_CONSISTENCY_FIELDS = [
       "الاستشاري",
     ],
     submissionFallbackKey: "officeName",
+    basicFieldKey: "officeName",
   },
   {
     field: "Plan Number",
@@ -1170,7 +1350,11 @@ const DATA_CONSISTENCY_FIELDS = [
       "رقم الصك",
       "الصك رقم",
       "رقم سند الملكية",
+      "رقم الوثيقة",
+      "الوثيقة رقم",
     ],
+    allowPrefixValue: true,
+    basicFieldKey: "deedNumber",
   },
 ];
 
@@ -1199,12 +1383,35 @@ function buildExpectedDataConsistencyFields(context) {
   ];
 }
 
-function findValueInAttachments(attachments, aliases) {
+function findValueInAttachments(attachments, fieldConfig) {
+  const aliases = Array.isArray(fieldConfig?.aliases) ? fieldConfig.aliases : [];
   for (const attachment of attachments) {
-    const value = extractFieldValueFromText(attachment.extractedText, aliases);
+    const value = extractFieldValueFromText(
+      attachment.extractedText,
+      aliases,
+      { allowPrefixValue: Boolean(fieldConfig?.allowPrefixValue) },
+    );
     if (value) {
       return {
         value,
+        sourceRef: attachment.name,
+      };
+    }
+  }
+
+  return null;
+}
+
+function findBasicFieldValueInAttachments(attachments, fieldKey) {
+  if (!fieldKey) {
+    return null;
+  }
+
+  for (const attachment of attachments) {
+    const value = attachment?.basicFields?.[fieldKey];
+    if (value) {
+      return {
+        value: cleanExtractedFieldValue(value),
         sourceRef: attachment.name,
       };
     }
@@ -1245,13 +1452,15 @@ function buildDataConsistencyRowsFromAttachments(context) {
       };
     }
 
-    const sakMatch = findValueInAttachments(
+    const sakMatch = findValueInAttachments(sakAttachments, fieldConfig);
+    const otherMatch = findValueInAttachments(nonSakAttachments, fieldConfig);
+    const sakBasicMatch = findBasicFieldValueInAttachments(
       sakAttachments,
-      fieldConfig.aliases,
+      fieldConfig.basicFieldKey,
     );
-    const otherMatch = findValueInAttachments(
+    const otherBasicMatch = findBasicFieldValueInAttachments(
       nonSakAttachments,
-      fieldConfig.aliases,
+      fieldConfig.basicFieldKey,
     );
     const submissionValue = fieldConfig.submissionFallbackKey
       ? normalizeText(
@@ -1259,8 +1468,10 @@ function buildDataConsistencyRowsFromAttachments(context) {
           120,
         )
       : "";
-    const otherValue = otherMatch?.value || submissionValue || "Missing";
-    const sakValue = sakMatch?.value || "Missing";
+    const otherValue =
+      otherBasicMatch?.value || otherMatch?.value || submissionValue || "Missing";
+    const sakValue =
+      sakBasicMatch?.value || sakMatch?.value || submissionValue || "Missing";
     const status =
       sakValue === "Missing" || otherValue === "Missing"
         ? "Missing"
@@ -1558,10 +1769,27 @@ function hasArchitecturalSemanticEvidence(itemText, context) {
       "مواقف السيارات",
       "مواقف",
       "parking",
+      "parking layout",
+      "parking area",
+      "parking areas",
+      "parking bay",
+      "parking bays",
+      "parking stall",
+      "parking stalls",
+      "car slot",
+      "car slots",
+      "car symbol",
+      "car symbols",
+      "aisle arrow",
+      "aisle arrows",
       "garage",
       "كراج",
       "مدخل سيارة",
       "منحدر سيارات",
+      "منطقة مواقف",
+      "منطقة حركة سيارات",
+      "مسار حركة سيارات",
+      "صفوف مواقف",
       "مواقف مرسومة",
       "صف مواقف",
     ].some((term) => evidenceText.includes(normalizeArabic(term)));
@@ -1734,15 +1962,28 @@ function buildArchitecturalChecklistGuidance(items) {
           "موقف سيارة",
           "مواقف سيارات",
           "parking",
+          "parking layout",
+          "parking area",
+          "parking areas",
           "parking bay",
           "parking bays",
           "parking stall",
           "parking stalls",
+          "car slot",
+          "car slots",
+          "car symbol",
+          "car symbols",
+          "aisle arrow",
+          "aisle arrows",
           "car park",
           "car parking",
           "garage",
           "موقف",
+          "منطقة مواقف",
+          "منطقة حركة سيارات",
+          "مسار حركة سيارات",
           "مواقف مرسومة",
+          "صفوف مواقف",
           "صف مواقف",
           "موقفين",
           "ثلاث مواقف",
@@ -1752,7 +1993,14 @@ function buildArchitecturalChecklistGuidance(items) {
           "منحدر سيارات",
           "كراج",
         ],
-        hints: ["مواقف مرسومة", "parking bay", "garage", "منحدر سيارات"],
+        hints: [
+          "مواقف مرسومة",
+          "parking bay",
+          "parking layout",
+          "aisle arrows",
+          "garage",
+          "منحدر سيارات",
+        ],
       },
     ],
     [
@@ -1917,15 +2165,28 @@ function buildArchitecturalChecklistFallback(itemText, context) {
       "موقف سيارة",
       "مواقف سيارات",
       "parking",
+      "parking layout",
+      "parking area",
+      "parking areas",
       "parking bay",
       "parking bays",
       "parking stall",
       "parking stalls",
+      "car slot",
+      "car slots",
+      "car symbol",
+      "car symbols",
+      "aisle arrow",
+      "aisle arrows",
       "car park",
       "car parking",
       "garage",
       "موقف",
+      "منطقة مواقف",
+      "منطقة حركة سيارات",
+      "مسار حركة سيارات",
       "مواقف مرسومة",
+      "صفوف مواقف",
       "صف مواقف",
       "موقفين",
       "ثلاث مواقف",
@@ -2013,10 +2274,25 @@ function buildArchitecturalChecklistFallback(itemText, context) {
     const normalizedSourceText = normalizeArabic(source.text);
     return [
       normalizeArabic("parking"),
+      normalizeArabic("parking layout"),
+      normalizeArabic("parking area"),
+      normalizeArabic("parking areas"),
       normalizeArabic("parking bay"),
+      normalizeArabic("parking bays"),
       normalizeArabic("parking stall"),
+      normalizeArabic("parking stalls"),
+      normalizeArabic("car slot"),
+      normalizeArabic("car slots"),
+      normalizeArabic("car symbol"),
+      normalizeArabic("car symbols"),
+      normalizeArabic("aisle arrow"),
+      normalizeArabic("aisle arrows"),
       normalizeArabic("مواقف"),
       normalizeArabic("موقف سيارة"),
+      normalizeArabic("منطقة مواقف"),
+      normalizeArabic("منطقة حركة سيارات"),
+      normalizeArabic("مسار حركة سيارات"),
+      normalizeArabic("صفوف مواقف"),
       normalizeArabic("كراج"),
       normalizeArabic("مدخل سيارة"),
     ].some((term) => normalizedSourceText.includes(term));
@@ -2217,6 +2493,67 @@ function buildRequirementsComplianceStatus(checklistRows, context) {
     : "Not Compliant";
 }
 
+function extractFirstLayerArchitecturalChecklistRows(context) {
+  const attachments = Array.isArray(context.attachments) ? context.attachments : [];
+  const architecturalAttachment = attachments.find((attachment) => {
+    const requiredDocument = normalizeArabic(attachment?.requiredDocument || "");
+    const detectedDocuments = Array.isArray(attachment?.detectedDocuments)
+      ? attachment.detectedDocuments
+      : [];
+    return (
+      requiredDocument.includes(normalizeArabic("المخططات المعمارية")) ||
+      detectedDocuments.some(
+        (documentName) =>
+          normalizeArabic(documentName).includes(
+            normalizeArabic("المخططات المعمارية"),
+          ),
+      )
+    );
+  });
+
+  const rawRows = Array.isArray(
+    architecturalAttachment?.aiValidation?.checklistResults,
+  )
+    ? architecturalAttachment.aiValidation.checklistResults
+    : [];
+
+  if (rawRows.length === 0) {
+    return [];
+  }
+
+  return rawRows
+    .map((row) => ({
+      item: normalizeText(row?.item, 160),
+      status: normalizeAttachmentChecklistStatus(row?.status),
+      comment:
+        normalizeText(row?.comment, 320) ||
+        "لم يتم العثور على دليل صريح لهذا البند داخل الملف الحالي.",
+      sourceRefs: architecturalAttachment?.name
+        ? [architecturalAttachment.name]
+        : [],
+    }))
+    .filter((row) => row.item);
+}
+
+function normalizeFirstLayerArchitecturalChecklistRows(rows) {
+  if (!Array.isArray(rows) || rows.length === 0) {
+    return [];
+  }
+
+  return rows
+    .map((row) => ({
+      item: normalizeText(row?.item, 160),
+      status: normalizeAttachmentChecklistStatus(row?.status),
+      comment:
+        normalizeText(row?.comment, 320) ||
+        "لم يتم العثور على دليل صريح لهذا البند داخل الملف الحالي.",
+      sourceRefs: Array.isArray(row?.sourceRefs)
+        ? row.sourceRefs.map((value) => normalizeText(value, 240)).filter(Boolean)
+        : [],
+    }))
+    .filter((row) => row.item);
+}
+
 function buildFinalSummaryFallback(context, derivedReport) {
   const derivedMissingDocuments = derivedReport.attachmentsStatus.rows
     .filter((row) => row.status === "Missing")
@@ -2255,6 +2592,244 @@ function buildFinalSummaryFallback(context, derivedReport) {
         ...derivedReport.architecturalCompliance.violations,
       ]),
     ).slice(0, 12),
+  };
+}
+
+function normalizeProvidedComplianceSnapshot(snapshot, context) {
+  if (!snapshot || typeof snapshot !== "object") {
+    return null;
+  }
+
+  const fallbackProjectType =
+    context.projectSubtypeTitle || context.projectTypeGroupTitle || "غير محدد";
+  const attachmentRows = Array.isArray(snapshot.attachmentsStatus?.rows)
+    ? snapshot.attachmentsStatus.rows.map((row) => ({
+        attachment: normalizeText(row?.attachment, 160),
+        status: normalizeValueFromSet(
+          row?.status,
+          ["Present", "Missing", "Invalid / Unclear"],
+          "Invalid / Unclear",
+        ),
+        notes: normalizeText(row?.notes, 320),
+        sourceRefs: normalizeStringList(row?.sourceRefs, 4),
+      }))
+    : [];
+  const dataConsistencyCheck = Array.isArray(snapshot.dataConsistencyCheck)
+    ? snapshot.dataConsistencyCheck.map((row) => ({
+        field: normalizeText(row?.field, 220),
+        sak: normalizeText(row?.sak, 160) || "Missing",
+        otherDocs: normalizeText(row?.otherDocs, 160) || "Missing",
+        status: normalizeValueFromSet(
+          row?.status,
+          ["Match", "Mismatch", "Missing"],
+          "Missing",
+        ),
+        sourceRefs: normalizeStringList(row?.sourceRefs, 4),
+      }))
+    : [];
+  const notesForCheck = normalizeFirstLayerArchitecturalChecklistRows(
+    snapshot.architecturalCompliance?.notesForCheck,
+  );
+  const violations = normalizeStringList(
+    snapshot.architecturalCompliance?.violations,
+    24,
+  );
+  const requirementsCompliance = normalizeValueFromSet(
+    snapshot.architecturalCompliance?.requirementsCompliance,
+    ["Compliant", "Not Compliant"],
+    notesForCheck.length > 0 && notesForCheck.every((row) => row.status === "Compliant")
+      ? "Compliant"
+      : "Not Compliant",
+  );
+
+  return {
+    projectInformation: {
+      projectType:
+        normalizeText(snapshot.projectInformation?.projectType, 120) ||
+        fallbackProjectType,
+      confidenceLevel: normalizeConfidenceLevel(
+        snapshot.projectInformation?.confidenceLevel,
+        context.confidence,
+      ),
+    },
+    attachmentsStatus: {
+      overallStatus: normalizeValueFromSet(
+        snapshot.attachmentsStatus?.overallStatus,
+        ["Complete", "Incomplete"],
+        "Incomplete",
+      ),
+      rows: attachmentRows,
+    },
+    dataConsistencyCheck,
+    attachmentAccuracy: {
+      status: normalizeValueFromSet(
+        snapshot.attachmentAccuracy?.status,
+        ["Valid", "Invalid", "Partially Valid"],
+        "Partially Valid",
+      ),
+      notes: normalizeStringList(snapshot.attachmentAccuracy?.notes, 12),
+    },
+    architecturalCompliance: {
+      requirementsCompliance,
+      notesForCheck,
+      violations,
+    },
+    finalSummary: {
+      attachments: normalizeText(snapshot.finalSummary?.attachments, 220),
+      dataConsistency: normalizeText(snapshot.finalSummary?.dataConsistency, 220),
+      architecturalCompliance: normalizeText(
+        snapshot.finalSummary?.architecturalCompliance,
+        220,
+      ),
+      keyIssues: normalizeStringList(snapshot.finalSummary?.keyIssues, 12),
+    },
+  };
+}
+
+function buildMunicipalityFollowUpComplianceReport(ruleReview, context) {
+  const providedComplianceSnapshot = normalizeProvidedComplianceSnapshot(
+    context.firstLayerComplianceSnapshot,
+    context,
+  );
+  if (providedComplianceSnapshot) {
+    return providedComplianceSnapshot;
+  }
+
+  const missingDocuments = normalizeStringList(ruleReview?.missingDocuments, 12);
+  const matchedDocuments = normalizeStringList(ruleReview?.matchedDocuments, 12);
+  const firstLayerArchitecturalRows =
+    normalizeFirstLayerArchitecturalChecklistRows(
+      context.firstLayerArchitecturalChecklistResults,
+    );
+  const effectiveArchitecturalRows =
+    firstLayerArchitecturalRows.length > 0
+      ? firstLayerArchitecturalRows
+      : extractFirstLayerArchitecturalChecklistRows(context);
+  const consistencyRows = buildDataConsistencyRowsFromAttachments({
+    attachments: Array.isArray(context.attachments) ? context.attachments : [],
+    submission: context.submission,
+    consistencyCheckItems: Array.isArray(context.consistencyCheckItems)
+      ? context.consistencyCheckItems
+      : [],
+    notesForCheckPath: context.notesForCheckPath || "",
+  });
+  const summaryStatus =
+    deriveRuleReviewStatus(ruleReview) === "ready"
+      ? "Complete"
+      : "Incomplete";
+  const confidenceLevel = normalizeConfidenceLevel(
+    undefined,
+    deriveRuleReviewStatus(ruleReview) === "ready"
+      ? 90
+      : deriveRuleReviewStatus(ruleReview) === "needs-info"
+        ? 55
+        : 20,
+  );
+
+  const attachmentsNotes =
+    missingDocuments.length > 0
+      ? `المرفقات الأساسية غير مكتملة وفق الفحص الأول: ${missingDocuments
+          .slice(0, 5)
+          .join("، ")}.`
+      : "المرفقات الأساسية ظاهرة ومقبولة وفق الفحص الأول.";
+
+  const dataConsistencyStatus = consistencyRows.every(
+    (row) => row.status === "Match",
+  )
+    ? "Match"
+    : consistencyRows.some((row) => row.status === "Mismatch")
+      ? "Mismatch"
+      : "Missing";
+
+  const architectureStatus =
+    effectiveArchitecturalRows.length > 0
+      ? effectiveArchitecturalRows.every((row) => row.status === "Compliant")
+        ? "Compliant"
+        : "Non-Compliant"
+      : deriveRuleReviewStatus(ruleReview) === "ready"
+        ? "Compliant"
+        : "Non-Compliant";
+
+  const architectureNotes =
+    effectiveArchitecturalRows.length > 0
+      ? "تمت إعادة استخدام نتيجة الامتثال المعماري من الفحص الأول دون إعادة تحليل."
+      : deriveRuleReviewStatus(ruleReview) === "ready"
+        ? "لا توجد نواقص معمارية جوهرية في نتيجة الفحص الأول."
+        : "الامتثال المعماري يحتاج استكمال البنود الناقصة الظاهرة في الفحص الأول.";
+
+  const architecturalViolations =
+    effectiveArchitecturalRows.length > 0
+      ? effectiveArchitecturalRows
+          .filter((row) => row.status !== "Compliant")
+          .map((row) => `${row.item}: ${row.comment}`)
+          .slice(0, 24)
+      : missingDocuments.length > 0
+        ? missingDocuments
+            .slice(0, 6)
+            .map((documentName) => `${documentName}: هذا المرفق مفقود ويجب استكماله.`)
+        : [];
+
+  return {
+    projectInformation: {
+      projectType:
+        context.projectSubtypeTitle ||
+        context.projectTypeGroupTitle ||
+        "غير محدد",
+      confidenceLevel,
+    },
+    attachmentsStatus: {
+      overallStatus: summaryStatus,
+      rows: [
+        {
+          attachment: "المرفقات الأساسية",
+          status: missingDocuments.length > 0 ? "Missing" : "Present",
+          notes: attachmentsNotes,
+          sourceRefs: [],
+        },
+      ],
+    },
+    dataConsistencyCheck: consistencyRows,
+    attachmentAccuracy: {
+      status:
+        missingDocuments.length > 0 ? "Partially Valid" : "Valid",
+      notes: [
+        attachmentsNotes,
+        "تم الاعتماد على نتيجة الفحص الأول فقط دون إعادة تحليل المرفقات.",
+      ],
+    },
+    architecturalCompliance: {
+      requirementsCompliance: architectureStatus,
+      notesForCheck:
+        effectiveArchitecturalRows.length > 0
+          ? effectiveArchitecturalRows
+          : [
+              {
+                item: "الامتثال المعماري",
+                status: architectureStatus,
+                comment: architectureNotes,
+                sourceRefs: [],
+              },
+            ],
+      violations: architecturalViolations,
+    },
+    finalSummary: {
+      attachments: attachmentsNotes,
+      dataConsistency:
+        dataConsistencyStatus === "Match"
+          ? "البيانات متطابقة وفق الفحص الأول."
+          : dataConsistencyStatus === "Mismatch"
+            ? "البيانات غير متطابقة وفق الفحص الأول."
+            : "البيانات تحتاج استكمالاً وفق الفحص الأول.",
+      architecturalCompliance: architectureNotes,
+      keyIssues:
+        missingDocuments.length > 0
+          ? missingDocuments
+              .slice(0, 6)
+              .map((documentName) => `${documentName}: هذا المرفق مفقود ويجب استكماله.`)
+          : matchedDocuments.length > 0
+            ? ["الملف متماسك مبدئياً وفق الفحص الأول."]
+            : ["لا توجد نتائج إضافية من الفحص الثاني."],
+    },
   };
 }
 
@@ -3346,6 +3921,7 @@ export function createReviewApp(options = {}) {
           "Return only the structured basicFields object and nothing else.",
           "Use the image as the source of truth and the local OCR text only as support.",
           "Prefer exact label-value pairs from the image.",
+          "Treat رقم الوثيقة, رقم الصك, and similar ownership-document labels as the same deed-number clue when they point to the deed identifier, but do not invent a value if the label is absent.",
           "Write all user-facing strings in Arabic.",
         ].join(" ")
       : [
@@ -3377,7 +3953,7 @@ export function createReviewApp(options = {}) {
             "استخرج فقط الحقول الأساسية الظاهرة من صورة الصك أو وثيقة التملك: اسم المستفيد، الهوية / السجل، المكتب الهندسي، رقم ترخيص المكتب، الحي، رقم القطعة / المخطط. إذا لم يظهر حقل بوضوح فاتركه فارغاً. لا تضف أي شرح.",
           outputSchema: {
             basicFields:
-              "object<{applicantName:string, nationalId:string, officeName:string, officeLicense:string, district:string, plotNumber:string}>",
+              "object<{applicantName:string, nationalId:string, officeName:string, officeLicense:string, district:string, plotNumber:string, deedNumber:string}>",
           },
           file: {
             fileName,
@@ -3396,7 +3972,7 @@ export function createReviewApp(options = {}) {
             notes: "string[]",
             confidence: "number 0-100",
             basicFields:
-              "object<{applicantName:string, nationalId:string, officeName:string, officeLicense:string, district:string, plotNumber:string}>",
+              "object<{applicantName:string, nationalId:string, officeName:string, officeLicense:string, district:string, plotNumber:string, deedNumber:string}>",
           },
           file: {
             fileName,
@@ -3437,7 +4013,10 @@ export function createReviewApp(options = {}) {
       });
 
       const { model, parsed } = completion;
-      const basicFields = normalizeBasicFieldSet(parsed.basicFields);
+      const basicFields = normalizeBasicFieldSet(
+        parsed.basicFields,
+        localExtractedText,
+      );
       const hasBasicFields = Object.values(basicFields).some(Boolean);
       return res.json({
         model,
@@ -3596,7 +4175,10 @@ export function createReviewApp(options = {}) {
       const { model, parsed } = completion;
       const modelSummary = normalizeText(parsed.summary, 280);
       const modelFeedback = normalizeStringList(parsed.feedback, 6);
-      const basicFields = normalizeBasicFieldSet(parsed.basicFields);
+      const basicFields = normalizeBasicFieldSet(
+        parsed.basicFields,
+        extractedText,
+      );
       const hasBasicFields = Object.values(basicFields).some(Boolean);
       const checklistResults = isArchitecturalPlansValidation
         ? buildChecklistRows(parsed.checklistResults, {
@@ -3679,7 +4261,13 @@ export function createReviewApp(options = {}) {
       });
     }
 
-    const { policy, submission, ruleReview } = req.body ?? {};
+    const {
+      policy,
+      submission,
+      ruleReview,
+      firstLayerArchitecturalChecklistResults,
+      firstLayerComplianceSnapshot,
+    } = req.body ?? {};
     if (!policy || !submission || !ruleReview) {
       return res
         .status(400)
@@ -3710,34 +4298,26 @@ export function createReviewApp(options = {}) {
     const consistencyCheckItems = structuredNotesForCheck.consistencyItems;
 
     const systemPrompt = [
-      "You are an expert municipal engineering license reviewer for Riyadh Municipality.",
-      "Respond only with valid JSON.",
-      "Be strict, deterministic, and evidence-based.",
-      "Never skip any step in the validation pipeline.",
-      "Do not assume missing data. Explicitly mark it as Missing.",
-      "If uncertainty exists, mark it as Unable to Verify. Do not guess.",
-      "Always reference which file or section your conclusion is based on whenever sourceRefs are requested.",
-      "Base the review strictly on the provided policy knowledge context, workflow evidence, uploaded attachment text, rule-based review, and the Notes for Check workbook items.",
-      "Treat the rule-based review as the primary baseline and provide supplemental reasoning, nuance, and risk assessment on top of it.",
-      "Do not override deterministic missing-document findings unless the uploaded text clearly supports a correction.",
-      "When tracked engineering sheets are requested, evaluate each one directly from the uploaded sheet text and detected sheet titles as the source evidence.",
-      "For each tracked sheet validation, include one to three short evidence snippets copied or closely paraphrased from the uploaded sheet text.",
-      "For architectural compliance, use the Unified Requirements source plus the Notes for Check workbook as validation sources.",
-      "When the architectural plans attachment is present, complianceReport.architecturalCompliance.notesForCheck must include one row for every architectural Notes for Check item using the exact item text provided in the payload.",
-      "When the architectural plans attachment is present, complianceReport.dataConsistencyCheck must also include one row for every workbook-driven consistency item using the exact field text provided in the payload, in addition to the baseline identity consistency rows.",
-      "The complianceReport object must follow the requested step-by-step structure exactly and must cover project type detection, attachment completeness, deed and beneficiary data consistency, attachment accuracy, requirements compliance, Notes for Check validation, violations, and final summary.",
-      "Inside complianceReport, use only these exact status values: Present, Missing, Invalid / Unclear, Match, Mismatch, Missing, Valid, Invalid, Partially Valid, Compliant, Non-Compliant, Not Found, Complete, Incomplete.",
-      "Suggested responses must be short operational replies that a municipal reviewer can send back to the engineering office, each tagged with an action type.",
-      "If a project type and subtype are provided, interpret the policy in light of that exact classification and prefer source-grounded subtype-specific requirements over generic assumptions.",
-      "If project type options are provided but no selection was made, mention the missing classification as a review limitation instead of inventing one.",
-      "Write all user-facing strings in Arabic.",
-      "Do not invent regulations that are not supported by the provided source excerpts.",
-      "Return a conservative recommendation for human approval support, not a legally binding final decision.",
-    ].join(" ");
+    "You are an expert municipal engineering license reviewer for Riyadh Municipality.",
+    "Respond only with valid JSON.",
+    "Be strict, deterministic, and evidence-based.",
+    "The first-phase ruleReview already contains the file analysis. Do not re-read the attachments or re-derive new findings from the uploaded files.",
+    "Use ruleReview as the single source of truth for the final municipal follow-up summary, missing items, and recommended actions.",
+    "Keep the municipality-facing summary extremely brief. If there are missing items, mention only the missing items. If there are no missing items, give one short readiness statement.",
+    "Do not invent a separate narrative, and do not add new missing items that are not already in ruleReview.",
+    "When tracking sheet or architectural compliance fields are returned, they must restate the first-phase outcome rather than reopen file analysis.",
+    "The complianceReport object must follow the requested step-by-step structure exactly, but should remain concise and aligned with ruleReview.",
+    "Inside complianceReport, use only these exact status values: Present, Missing, Invalid / Unclear, Match, Mismatch, Missing, Valid, Invalid, Partially Valid, Compliant, Non-Compliant, Not Found, Complete, Incomplete.",
+    "Suggested responses must be short operational replies that a municipal reviewer can send back to the engineering office, each tagged with an action type.",
+    "Write all user-facing strings in Arabic.",
+    "Do not invent regulations that are not supported by the provided source excerpts.",
+    "Write all user-facing strings in Arabic.",
+    "Return a conservative recommendation for human approval support, not a legally binding final decision.",
+  ].join(" ");
 
     const userPayload = {
       instruction:
-        "حلل الملفات، تحقق منها، ثم أخرج تقرير امتثال منظم وفق الخطوات التالية دون تخطي أي خطوة: 1) تحديد نوع المشروع وتحديد المرفقات المطلوبة. 2) فحص اكتمال المرفقات وتصنيف كل مرفق Present أو Missing أو Invalid / Unclear. 3) التحقق من اتساق بيانات المستفيد والصك عبر Plot Number وBeneficiary Name وEngineering Office وPlan Number وDeed Number. 4) التحقق من دقة المرفقات ومدى ارتباطها الفعلي بالصك ونوع المشروع. 5) مراجعة الامتثال المعماري بالاعتماد على ملف الاشتراطات الموحد وملف Notes for Check والمخططات المعمارية، مع فحص جميع عناصر Notes for Check وإخراج المخالفات بوضوح. 6) إصدار ملخص نهائي قرار-جاهز واضح ومباشر.",
+        "بناءً على ruleReview فقط، أخرج ملخصاً بلدياً نهائياً ومختصراً دون إعادة تحليل المرفقات أو استنتاج أي معلومات جديدة من الملفات. استخدم ما ورد في ruleReview كمرجع أساسي، وركز على الاستكمالات الناقصة والقرار النهائي المختصر.",
       outputSchema: {
         model: "string",
         decision: "approve-with-human-check | needs-more-info | reject-for-now",
@@ -3822,20 +4402,19 @@ export function createReviewApp(options = {}) {
         projectSubtypeId: submission.projectSubtypeId,
         projectTypeGroupTitle: projectTypeContext.selectedGroup?.title ?? "",
         projectSubtypeTitle: projectTypeContext.selectedSubtype?.title ?? "",
-        projectDescription: submission.projectDescription,
-        comments: submission.comments,
-        attachments: compactAttachments(submission.uploadedAttachments ?? []),
       },
-      trackedDocuments: trackedDocuments.map((documentName) => ({
-        documentName,
-        relatedAttachments: compactAttachments(
-          (submission.uploadedAttachments ?? []).filter(
-            (attachment) =>
-              Array.isArray(attachment.detectedDocuments) &&
-              attachment.detectedDocuments.includes(documentName),
-          ),
-        ),
-      })),
+      firstPhaseReview: {
+        status: ruleReview.status,
+        summary: ruleReview.summary,
+        nextStep: ruleReview.nextStep,
+        matchedDocuments: ruleReview.matchedDocuments,
+        missingDocuments: ruleReview.missingDocuments,
+        policyAlerts: ruleReview.policyAlerts,
+        suggestedResponses: ruleReview.suggestedResponses,
+        documentValidations: ruleReview.documentValidations,
+      },
+      firstLayerArchitecturalChecklistResults,
+      firstLayerComplianceSnapshot,
       ruleReview,
     };
 
@@ -3857,16 +4436,47 @@ export function createReviewApp(options = {}) {
         submission,
         ruleReview,
       );
+      const alignedDecision = normalizeValueFromSet(
+        deriveRuleReviewStatus(ruleReview) === "ready"
+          ? "approve-with-human-check"
+          : deriveRuleReviewStatus(ruleReview) === "needs-info"
+            ? "needs-more-info"
+            : "reject-for-now",
+        [
+          "approve-with-human-check",
+          "needs-more-info",
+          "reject-for-now",
+        ],
+        "needs-more-info",
+      );
+      const alignedSummary = buildBriefAlignedLlmSummary(
+        ruleReview,
+        policy.title,
+      );
+      const alignedReasoning = buildBriefAlignedLlmBullets(ruleReview);
+      const alignedMissingItems = normalizeStringList(
+        ruleReview?.missingDocuments,
+        6,
+      );
+      const alignedRisks = normalizeStringList(ruleReview?.policyAlerts, 6);
+      const alignedSuggestedActions = Array.isArray(
+        ruleReview?.suggestedResponses,
+      )
+        ? ruleReview.suggestedResponses
+            .map((response) => normalizeText(response.text, 220))
+            .filter(Boolean)
+            .slice(0, 6)
+        : [];
       return res.json({
         model,
         generatedAt: new Date().toISOString(),
-        decision: parsed.decision,
+        decision: alignedDecision,
         confidence: derivedConfidence,
-        summary: parsed.summary,
-        reasoning: parsed.reasoning ?? [],
-        missingItems: parsed.missingItems ?? [],
-        risks: parsed.risks ?? [],
-        suggestedActions: parsed.suggestedActions ?? [],
+        summary: alignedSummary,
+        reasoning: alignedReasoning,
+        missingItems: alignedMissingItems,
+        risks: alignedRisks,
+        suggestedActions: alignedSuggestedActions,
         documentValidations: normalizeDocumentValidations(
           parsed.documentValidations,
           trackedDocuments,
@@ -3875,23 +4485,19 @@ export function createReviewApp(options = {}) {
         suggestedResponses: normalizeSuggestedResponses(
           parsed.suggestedResponses,
         ),
-        complianceReport: normalizeComplianceReport(parsed.complianceReport, {
-          requiredDocuments: effectiveRequiredDocuments,
-          attachments: submission.uploadedAttachments ?? [],
-          submission,
-          matchedDocuments: Array.isArray(ruleReview.matchedDocuments)
-            ? ruleReview.matchedDocuments
-            : [],
-          missingDocuments: Array.isArray(ruleReview.missingDocuments)
-            ? ruleReview.missingDocuments
-            : [],
-          projectTypeGroupTitle: projectTypeContext.selectedGroup?.title ?? "",
-          projectSubtypeTitle: projectTypeContext.selectedSubtype?.title ?? "",
-          notesForCheckItems,
-          consistencyCheckItems,
-          notesForCheckPath: notesForCheckContext.sourcePath,
-          confidence: derivedConfidence,
-        }),
+        complianceReport: buildMunicipalityFollowUpComplianceReport(
+          ruleReview,
+          {
+            projectTypeGroupTitle: projectTypeContext.selectedGroup?.title ?? "",
+            projectSubtypeTitle: projectTypeContext.selectedSubtype?.title ?? "",
+            submission,
+            attachments: compactAttachments(submission.uploadedAttachments ?? []),
+            firstLayerArchitecturalChecklistResults,
+            firstLayerComplianceSnapshot,
+            consistencyCheckItems,
+            notesForCheckPath: notesForCheckContext.sourcePath,
+          },
+        ),
         evidence: Array.isArray(parsed.evidence)
           ? parsed.evidence
           : knowledgeContext.citations,

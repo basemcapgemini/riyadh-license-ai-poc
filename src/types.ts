@@ -54,6 +54,7 @@ export type BasicFormFields = {
   officeLicense: string;
   district: string;
   plotNumber: string;
+  deedNumber?: string;
 };
 
 export type AttachmentSourceType =
@@ -233,6 +234,8 @@ export type ComplianceReport = {
     keyIssues: string[];
   };
 };
+
+export type FirstLayerComplianceSnapshot = ComplianceReport;
 
 export type LlmReview = {
   model: string;
