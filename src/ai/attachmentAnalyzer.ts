@@ -377,6 +377,7 @@ async function runPdfOcrFallback(
   pages: string[],
   fileName: string,
   reportProgress: ProgressReporter,
+  priorityPageNumbers: number[] = [],
 ): Promise<string[]> {
   const weakPageNumbers = pages
     .map((pageText, index) => ({ pageNumber: index + 1, pageText }))
@@ -384,10 +385,26 @@ async function runPdfOcrFallback(
     .map(({ pageNumber }) => pageNumber)
     .filter(Boolean);
 
-  const sampledWeakPageNumbers = sampleEvenly(
-    weakPageNumbers,
-    Math.min(MAX_PDF_OCR_FALLBACK_PAGES, weakPageNumbers.length),
+  const prioritizedWeakPageNumbers = Array.from(
+    new Set(
+      priorityPageNumbers
+        .filter((pageNumber) => weakPageNumbers.includes(pageNumber))
+        .slice(0, MAX_PDF_OCR_FALLBACK_PAGES),
+    ),
   );
+  const remainingSlots = Math.max(
+    0,
+    MAX_PDF_OCR_FALLBACK_PAGES - prioritizedWeakPageNumbers.length,
+  );
+  const sampledWeakPageNumbers = Array.from(
+    new Set([
+      ...prioritizedWeakPageNumbers,
+      ...sampleEvenly(
+        weakPageNumbers,
+        Math.min(remainingSlots, weakPageNumbers.length),
+      ),
+    ]),
+  ).sort((left, right) => left - right);
 
   if (sampledWeakPageNumbers.length === 0) {
     return pages;
@@ -617,9 +634,9 @@ async function buildPdfPageImagesForAi(
       return {
         pageNumber,
         dataUrl: await renderPdfPageToDataUrl(page, {
-          scale: 1.1,
+          scale: 1.45,
           mimeType: "image/jpeg",
-          quality: 0.68,
+          quality: 0.82,
         }),
       };
     },
@@ -648,11 +665,15 @@ async function buildPdfPageImagesForCadClassification(
 }
 
 function sampleEvenly(pageNumbers: number[], targetCount: number): number[] {
+  if (targetCount <= 0) {
+    return [];
+  }
+
   if (pageNumbers.length <= targetCount) {
     return [...pageNumbers];
   }
 
-  if (targetCount <= 1) {
+  if (targetCount === 1) {
     return pageNumbers.length > 0 ? [pageNumbers[0]] : [];
   }
 
@@ -922,7 +943,17 @@ async function readPdf(
       .join("\n\n"),
   ).slice(0, MAX_ATTACHMENT_TEXT_LENGTH);
 
-  pages = await runPdfOcrFallback(pdf, pages, file.name, reportProgress);
+  const priorityOcrPages = isArchitecturalPdfCandidate(file.name, [])
+    ? [1, 2, 3]
+    : [1, 2];
+
+  pages = await runPdfOcrFallback(
+    pdf,
+    pages,
+    file.name,
+    reportProgress,
+    priorityOcrPages,
+  );
   extractedText = normalizeExtractedText(
     pages
       .map((pageText, index) =>
